@@ -47,28 +47,6 @@ The script is built around a simple `[target] [module]` structure. If no module 
 
 ```bash
 usage: null-reaper.py [-h] target [module]
-
-A specialized, multi-protocol AD Enumeration Tool for null sessions.
-
-positional arguments:
-  target      The target IP address.
-  module      The module to run (smb, dcinfo, roast). Scans all if omitted.
-
-options:
-  -h, --help  show this help message and exit
-
-    Examples:
-      Scan all modules (default):
-        python null-reaper.py target
-
-      Scan only for open SMB shares and files:
-        python null-reaper.py target smb
-
-      Get DC info and enumerate users (LDAP + SAMR):
-        python null-reaper.py target dcinfo
-
-      Enumerate users and actively test for AS-REP Roasting:
-        python null-reaper.py target roast
 ```
 
 ---
@@ -89,8 +67,3 @@ This cannot be stressed enough. `Null-Reaper` is an **active scanner** that gene
 
 Pull requests are welcome. This tool was built to find "nuances," and it can only be tested on a limited number of machines. If you find it fails on a specific box or you have a new "nuance" to add, feel free to open an issue or PR.
 
----
-
-## License
-
-This project is licensed under the MIT License.
