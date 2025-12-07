@@ -15,22 +15,17 @@ mermehr...
 import sys
 import argparse
 import ipaddress
+
+from impacket.dcerpc.v5 import samr, transport
+from impacket.dcerpc.v5.samr import DCERPCException, UF_ACCOUNTDISABLE
 from impacket.krb5 import constants
 from impacket.krb5.kerberosv5 import getKerberosTGT
 from impacket.krb5.types import Principal
-from impacket.dcerpc.v5.samr import UF_ACCOUNTDISABLE, DCERPCException
-from impacket.dcerpc.v5 import transport, samr
-from ldap3 import Server, Connection, ANONYMOUS, SUBTREE, BASE, ALL_ATTRIBUTES
-from ldap3.core.exceptions import LDAPInvalidCredentialsResult
-from impacket.smbconnection import SMBConnection, SessionError
 from impacket.nmb import NetBIOSError
 from impacket.smb3 import FILE_ATTRIBUTE_DIRECTORY
-import datetime
-import random
-from impacket.krb5.asn1 import AS_REQ, KERB_PA_PAC_REQUEST, AS_REP, seq_set
-from impacket.krb5.kerberosv5 import sendReceive, getKerberosTGT
-from impacket.krb5 import types
-from pyasn1.codec.der import decoder, encoder
+from impacket.smbconnection import SMBConnection, SessionError
+from ldap3 import Server, Connection, ANONYMOUS, SUBTREE, BASE, ALL_ATTRIBUTES
+from ldap3.core.exceptions import LDAPInvalidCredentialsResult
 
 # Windows error codes for session status.
 STATUS_LOGON_FAILURE = 0xC000006D
