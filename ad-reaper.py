@@ -851,7 +851,7 @@ Examples:
 
     if is_authenticated_scan:
         if args.password and args.hashes:
-            parser.error("Please provide either a password (-p) or hashes (-h), not both.")
+            parser.error("Please provide either a password (-p) or hashes (-H), not both.")
         
         password = args.password or ""
         lmhash, nthash = ("", "")
