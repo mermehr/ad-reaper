@@ -38,27 +38,21 @@ Run with credentials (password or NTLM hash) to audit privileges and find attack
 
 1. Clone the repository:
 
-   Bash
-
-   ```
+   ```bash
    git clone https://github.com/mermehr/null-reaper.git
    cd null-reaper
    ```
 
 2. Create and activate a virtual environment:
-
-   Bash
-
-   ```
+  
+   ```bash
    python3 -m venv .venv
    source .venv/bin/activate
    ```
 
 3. Install the required Python modules:
 
-   Bash
-
-   ```
+   ```bash
    pip install -r requirements.txt
    ```
 
@@ -68,11 +62,7 @@ Run with credentials (password or NTLM hash) to audit privileges and find attack
 
 ```bash
 usage: ad-reaper.py [-h] [-u USERNAME] [-p PASSWORD] [-H HASHES] target
-```
 
-#### Examples:
-
-```bash
   Run anonymous scan (null sessions, AS-REP roast, etc.):
     python ad-reaper.py 192.168.1.100
 
@@ -106,6 +96,8 @@ At the end of every scan, `AD-Reaper` analyzes the findings and prints **Actiona
 ## Contributing
 
 Pull requests are welcome. This tool was built to handle the "nuances" of different Windows Server configurations. If you find it fails on a specific box, feel free to open an issue or PR.
+
+------
 
 ## Preview
 
