@@ -9,11 +9,10 @@ to provide a broad overview of an Active Directory environment's security postur
 Default Mode (Anonymous):
 Performs quick, multi-protocol enumeration targeting low-hanging fruit like
 anonymous null sessions. It combines LDAP, SAMR, and SMB enumeration with
-active vulnerability testing (e.g., AS-REP Roasting).
+active vulnerability testing..
 
-Authenticated Mode (-a/--authenticated):
-Leverages credentials to perform a deep-dive enumeration, answering the question:
-"What can this specific user see and do?" It checks for accessible shares,
+Authenticated Mode:
+Leverages credentials to perform a deep-dive enumeration. It checks for accessible shares,
 remote access pathways, and common AD misconfigurations.
 """
 
@@ -26,10 +25,10 @@ from impacket.dcerpc.v5 import samr, transport, dcomrt
 from impacket.dcerpc.v5.dcom import wmi
 from impacket.dcerpc.v5.ndr import NULL
 from impacket.dcerpc.v5.samr import DCERPCException
-from impacket.dcerpc.v5.samr import DCERPCException, UF_ACCOUNTDISABLE
+from impacket.dcerpc.v5.samr import UF_ACCOUNTDISABLE
 from impacket.krb5 import constants
 from impacket.krb5.kerberosv5 import getKerberosTGT
-from impacket.krb5.types import Principal, KerberosTime
+from impacket.krb5.types import Principal
 from impacket.nmb import NetBIOSError
 from impacket.smb3 import FILE_ATTRIBUTE_DIRECTORY
 from impacket.smbconnection import SMBConnection, SessionError
@@ -190,7 +189,8 @@ def query_ldap_anonymous(target_ip):
                 return None, [], []
 
             for attr in domain_attrs:
-                if attr == 'defaultNamingContext': continue
+                if attr == 'defaultNamingContext':
+                    continue
                 if attr in domain_info:
                     value = domain_info[attr].value
                     attr_formatted = ' '.join(word.capitalize() for word in attr.replace('Functionality', ' Func Level').split())
@@ -202,7 +202,7 @@ def query_ldap_anonymous(target_ip):
                         print(f"  - {Style.CYAN}{attr_formatted}:{Style.RESET} {value}")
             
             print_info("Querying for active, non-system user accounts...")
-            real_users_filter = f'(& (objectClass=person) (!(objectClass=computer)) (!(userAccountControl:1.2.840.113556.1.4.803:=2)) (!(sAMAccountName=HealthMailbox*)))'
+            real_users_filter = '(& (objectClass=person) (!(objectClass=computer)) (!(userAccountControl:1.2.840.113556.1.4.803:=2)) (!(sAMAccountName=HealthMailbox*)))'
             real_users_filter = f'(& (objectClass=person) (!(objectClass=computer)) (!(userAccountControl:1.2.840.113556.1.4.803:={UF_ACCOUNTDISABLE})) (!(sAMAccountName=HealthMailbox*)))'
             conn.search(search_base=domain_dn, search_filter=real_users_filter, search_scope=SUBTREE, attributes=['sAMAccountName', 'description'], size_limit=0)
 
@@ -340,6 +340,7 @@ def check_asrep_roastable_users(target_ip, domain_dn, user_list):
     Checks for the AS-REP Roasting vulnerability by attempting to get a TGT
     for each user without pre-authentication. Returns a list of vulnerable users.
     """
+    # TODO: Get TGT and print to screen in hashcat format
     if not domain_dn or not user_list:
         print_info("Skipping AS-REP Roast check (missing domain or user list).")
         return []
@@ -395,7 +396,7 @@ def get_domain_from_ldap(target_ip):
     server = Server(target_ip, get_info=['defaultNamingContext'])
     conn = None
     try:
-        conn = Connection(server, authentication=ANONYMOUS, auto_bind=True)
+        conn = Connection(server, authentication=ANONYMOUS, auto_bind=True)  # noqa: F841
         if server.info and server.info.other.get('defaultNamingContext'):
             domain_dn = server.info.other['defaultNamingContext'][0]
             netbios_name = domain_dn.split(',')[0].replace('DC=', '').upper()
@@ -532,7 +533,7 @@ def enumerate_ldap_auth(target_ip, domain, username, password, lmhash, nthash):
                          user_groups.append(primary_group_name)
 
         print_info("Querying for active, non-system user accounts...")
-        real_users_filter = f'(& (objectClass=person) (!(objectClass=computer)) (!(userAccountControl:1.2.840.113556.1.4.803:=2)) (!(sAMAccountName=HealthMailbox*)))'
+        real_users_filter = '(& (objectClass=person) (!(objectClass=computer)) (!(userAccountControl:1.2.840.113556.1.4.803:=2)) (!(sAMAccountName=HealthMailbox*)))'
         real_users_filter = f'(& (objectClass=person) (!(objectClass=computer)) (!(userAccountControl:1.2.840.113556.1.4.803:={UF_ACCOUNTDISABLE})) (!(sAMAccountName=HealthMailbox*)))'
         conn.search(search_base, real_users_filter, search_scope=SUBTREE, attributes=['sAMAccountName', 'description'], size_limit=0)
         if conn.entries:
@@ -567,7 +568,8 @@ def enumerate_ldap_auth(target_ip, domain, username, password, lmhash, nthash):
             for entry in conn.entries:
                 u = entry.sAMAccountName.value
                 spn_val = entry.servicePrincipalName.value
-                if isinstance(spn_val, list): spn_val = spn_val[0]
+                if isinstance(spn_val, list):
+                    spn_val = spn_val[0]
                 
                 # Differentiate between user and machine accounts for suggestions
                 if not u.endswith('$'):
@@ -726,24 +728,24 @@ def print_suggestions(target_ip, findings, auth_creds=None):
         print(f"{Style.YELLOW}[!] Unconstrained Delegation Found:{Style.RESET}")
         print("  The following accounts can impersonate users on any service on their host.")
         print("  If you gain control of one, you can capture TGTs from incoming authentications (e.g., from Domain Admins).")
-        print(f"  > Consider using tools like BloodHound to visualize attack paths or manually check for printer spooler abuse.\n")
+        print("  > Consider using tools like BloodHound to visualize attack paths or manually check for printer spooler abuse.\n")
         suggestions_made = True
 
     if findings.get('laps_readable'):
         print(f"{Style.YELLOW}[!] Readable LAPS Passwords Found:{Style.RESET}")
         print("  You have permissions to read local administrator passwords for some machines.")
-        print(f"  > Use these credentials for lateral movement with tools like evil-winrm, psexec.py, or smbexec.py.\n")
+        print("  > Use these credentials for lateral movement with tools like evil-winrm, psexec.py, or smbexec.py.\n")
         suggestions_made = True
 
     if findings.get('admin_users'):
         print(f"{Style.YELLOW}[!] Privileged Accounts (adminCount=1) Identified:{Style.RESET}")
         print("  These accounts are or were members of privileged groups.")
-        print(f"  > They are high-value targets for credential theft and lateral movement.\n")
+        print("  > They are high-value targets for credential theft and lateral movement.\n")
         suggestions_made = True
 
     if findings.get('no_users_found'):
         print(f"{Style.YELLOW}[!] No Users Found via Anonymous Enumeration:{Style.RESET}")
-        domain_name = findings.get('domain_name', 'TARGET-DC').split('.')[0].upper()
+        # domain_name = findings.get('domain_name', 'TARGET-DC').split('.')[0].upper() 
         print("  Standard enumeration failed to find users. You can try to discover them")
         print("  by brute-forcing Relative IDs (RIDs).")
         print(f"  > {Style.CYAN}nxc smb {target_ip} -u guest -p '' --rid-brute | grep SidTypeUser | cut -d'\' -f2 | cut -d' ' -f1 | tee users {Style.RESET}\n")
@@ -782,7 +784,7 @@ def run_anonymous_scan(target_ip):
         with open("ad_users.txt", "w") as f:
             for user in sorted(list(master_user_set)):
                 f.write(f"{user}\n")
-        print_info(f"Full user list saved to ad_users.txt")
+        print_info("Full user list saved to ad_users.txt")
     else:
         findings['no_users_found'] = True
 
@@ -799,7 +801,8 @@ def run_authenticated_scan(target_ip, username, password, lmhash, nthash):
 
     if not domain:
         domain = get_domain_from_ldap(target_ip)
-        if not domain: print_error("Could not auto-discover domain. Authentication may fail.")
+        if not domain:
+            print_error("Could not auto-discover domain. Authentication may fail.")
 
     search_base, user_groups, ldap_findings = enumerate_ldap_auth(target_ip, domain, user, password, lmhash, nthash)
     findings.update(ldap_findings)
@@ -820,13 +823,13 @@ def main():
         epilog=f"""
 Examples:
   Run anonymous scan (null sessions, AS-REP roast, etc.):
-    {Style.CYAN}python %(prog)s 192.168.1.100{Style.RESET}
+    {Style.CYAN}python %(prog)s 192.168.56.10{Style.RESET}
 
   Run authenticated scan with a password:
-    {Style.CYAN}python %(prog)s 192.168.1.100 -u 'DOMAIN/user' -p 'Password123'{Style.RESET}
+    {Style.CYAN}python %(prog)s 192.168.56.10 -u 'DOMAIN/user' -p 'Password123'{Style.RESET}
 
   Run authenticated scan using Pass-the-Hash:
-    {Style.CYAN}python %(prog)s 192.168.1.100 -u 'Admin' -H 'aad3...:31d6...'{Style.RESET}
+    {Style.CYAN}python %(prog)s 172.16.10.5 -u 'Admin' -H 'aad3...:31d6...'{Style.RESET}
 """,
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
