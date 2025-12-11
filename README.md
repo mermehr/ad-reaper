@@ -2,7 +2,7 @@
 
 A comprehensive Active Directory enumeration tool for the modern pentester.
 
-`AD-Reaper` streamlines the workflow from **initial foothold** (finding null sessions) to **authenticated auditing** (finding privilege escalation paths). It combines anonymous enumeration techniques with authenticated deep-dives to answer the question: *"What can I see and do with this specific access?"*
+`AD-Reaper` streamlines the workflow from **initial foothold** (finding null sessions) to **authenticated auditing** (finding privilege escalation paths). It combines anonymous enumeration techniques with authenticated deep-dives.
 
 Instead of running five different tools to check for basic mis configurations, `AD-Reaper` chains them into a single, high-signal scan. Relies on `impacket` and `ldap3` python modules.
 
@@ -39,8 +39,8 @@ Run with credentials (password or NTLM hash) to audit privileges and find attack
 1. Clone the repository:
 
    ```bash
-   git clone https://github.com/mermehr/null-reaper.git
-   cd null-reaper
+   git clone https://github.com/mermehr/ad-reaper.git
+   cd ad-reaper
    ```
 
 2. Create and activate a virtual environment:
@@ -64,13 +64,13 @@ Run with credentials (password or NTLM hash) to audit privileges and find attack
 usage: ad-reaper.py [-h] [-u USERNAME] [-p PASSWORD] [-H HASHES] target
 
   Run anonymous scan (null sessions, AS-REP roast, etc.):
-    python ad-reaper.py 192.168.1.100
+    python ad-reaper.py 192.168.56.10
 
   Run authenticated scan with a password:
-    python ad-reaper.py 192.168.1.100 -u 'DOMAIN/user' -p 'Password123'
+    python ad-reaper.py 192.168.56.10 -u 'DOMAIN/user' -p 'Password123'
 
   Run authenticated scan using Pass-the-Hash:
-    python ad-reaper.py 192.168.1.100 -u 'Admin' -H 'aad3...:31d6...'
+    python ad-reaper.py 172.16.10.5 -u 'Admin' -H 'aad3...:31d6...'
 ```
 
 ### Automatic Suggestions
