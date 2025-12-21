@@ -1,10 +1,10 @@
 # AD-Reaper
 
-A comprehensive Active Directory enumeration tool for the modern pentester.
+A comprehensive Active Directory enumeration tool.
 
-`AD-Reaper` streamlines the workflow from **initial foothold** (finding null sessions) to **authenticated auditing** (finding privilege escalation paths). It combines anonymous enumeration techniques with authenticated deep-dives.
+`AD-Reaper` helps with getting an **initial foothold** (finding null sessions) to **authenticated auditing** (finding privilege escalation paths). It combines anonymous enumeration techniques with authenticated deep-dives.
 
-Instead of running five different tools to check for basic mis configurations, `AD-Reaper` chains them into a single, high-signal scan. Relies on `impacket` and `ldap3` python modules.
+Created while doing machines on HTB, mainly in the hopes that it will assist me while doing the CPTS and OSCP exams. The primary purpose of this tool was to facilitate initial access, address memory gaps, and streamline workflow. However, it will assist you with gaining administrator access to a few boxes.
 
 ## Modes & Features
 
@@ -79,7 +79,7 @@ At the end of every scan, `AD-Reaper` analyzes the findings and prints **Actiona
 
 ------
 
-## Operational Security (OpSec)
+## OpSec
 
 **This tool is loud.**
 
