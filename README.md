@@ -2,9 +2,9 @@
 
 A comprehensive Active Directory enumeration tool.
 
-`AD-Reaper` helps with getting an **initial foothold** (finding null sessions) to **authenticated auditing** (finding privilege escalation paths). It combines anonymous enumeration techniques with authenticated deep-dives.
+`AD-Reaper` helps with getting an **initial foothold** (finding null sessions) to **authenticated auditing** (finding privilege escalation paths). It combines anonymous enumeration techniques with deeper authenticated scanning.
 
-Created while doing machines on HTB, mainly in the hopes that it will assist me while doing the CPTS and OSCP exams. The primary purpose of this tool was to facilitate initial access, address memory gaps, and streamline workflow. However, it will assist you with gaining administrator access to a few boxes.
+Created while doing various CTFs, mainly in the hopes that it will assist me while doing the CPTS and OSCP exams. The primary purpose of this tool was to facilitate initial access, address memory gaps, and streamline my workflow.
 
 ## Modes & Features
 
@@ -15,21 +15,21 @@ Run without credentials to find your initial entry point. This mode aggressively
 - **Null Session Hunting:** Automatically tries both `''` and `.` usernames to bypass weak null session filters on SMB and SAMR.
 - **Recursive SMB Walking:** If a null session is found, it recursively walks directories to find sensitive files (e.g., `web.config`, `passwords.txt`).
 - **Hybrid User Enumeration:** Generates a master user list by combining anonymous LDAP queries (active users) with RPC/SAMR enumeration (all users/RIDs).
-- **AS-REP Roasting:** Automatically tests the discovered user list for accounts that do not require Kerberos pre-authentication.
+- **AS-REP Roasting:** Automatically tests the discovered user list for accounts that do not require Kerberos pre-authentication and dumps the hashes.
 
-### Authenticated Mode (`-u`)
+### Authenticated Mode
 
 Run with credentials (password or NTLM hash) to audit privileges and find attack paths.
 
 - **Access Auditing:**
   - **SMB:** Lists accessible shares and performs an **active write check** (creates/deletes a temp file) to confirm true permissions.
   - **Remote Access:** Checks for open paths via WinRM (5985), RDP (3389), and WMI (135), correlating them with group memberships.
-- **LDAP Deep-Dive:**
+- **LDAP:**
   - **LAPS:** Checks if the user can read cleartext LAPS passwords.
   - **Delegation:** Identifies accounts with Unconstrained Delegation.
   - **Groups:** Dumps full group memberships, including primary groups.
 - **Attack Primitives:**
-  - **Kerberoasting:** Identifies users with SPNs and generates `GetUserSPNs.py` syntax.
+  - **Kerberoasting:** Identifies user accounts with SPNs and attempts Kerberoasting.
   - **Pass-the-Hash:** Full support for NTLM hash authentication (`-H`).
 
 ------
@@ -61,8 +61,11 @@ Run with credentials (password or NTLM hash) to audit privileges and find attack
 ## Usage
 
 ```bash
-usage: ad-reaper.py [-h] [-u USERNAME] [-p PASSWORD] [-H HASHES] target
+usage: ad-reaper.py [-h] [-u USERNAME] [-p PASSWORD] [-H HASHES] [--dump-hashes]
+                    [--hash-format {john,hashcat}] [--output-dir OUTPUT_DIR]
+                    target
 
+Examples:
   Run anonymous scan (null sessions, AS-REP roast, etc.):
     python ad-reaper.py 192.168.56.10
 
@@ -73,17 +76,9 @@ usage: ad-reaper.py [-h] [-u USERNAME] [-p PASSWORD] [-H HASHES] target
     python ad-reaper.py 172.16.10.5 -u 'Admin' -H 'aad3...:31d6...'
 ```
 
-### Automatic Suggestions
-
-At the end of every scan, `AD-Reaper` analyzes the findings and prints **Actionable Suggestions**. These are copy-paste ready commands for tools like `Impacket`, `Certipy`, and `NetExec` to help you immediately exploit what you found.
-
-------
-
 ## OpSec
 
 **This tool is loud.**
-
-`AD-Reaper` is an **active scanner** designed for CTFs and engagements where noise is not a primary constraint.
 
 - It touches the disk (SMB write checks).
 - It generates significant LDAP and RPC traffic.
@@ -101,14 +96,4 @@ Pull requests are welcome. This tool was built to handle the "nuances" of differ
 
 ## Preview
 
-### Null scan
-
-![screenshot](assets/anon1.png)
-
-![screenshot](assets/anon2.png)
-
-### Authenticated scan
-
-![screenshot](assets/auth1.png)
-
-![screenshot](assets/auth2.png)
+![session](https://raw.githubusercontent.com/mermehr/media/main/2026/01/upgit_20260117_1768657485.gif)
