@@ -1,4 +1,11 @@
-.vscode
+.vscode/
+.idea/
 .DS_Store
-.env
-.venv
+.env/
+.venv/
+venv/
+pycache/
+
+reaper.log
+ad_users.txt
+*_hashes.txt
