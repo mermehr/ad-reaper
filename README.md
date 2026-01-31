@@ -84,19 +84,15 @@ Authentication:
   -d, --domain DOMAIN   Force domain name (useful when discovery fails)
 
 Roasting & Output:
-  --dump-hashes         Dump AS-REP / Kerberoast hashes
   --hash-format {john,hashcat}
-  --output-dir OUTPUT_DIR
-                        Where to save files
+  -o, --output OUTPUT   Output dir for logs and hashes (default: reaper-logs)
+  --no-logging          Disable file logging (logs and hashes)
   --users-file USERS_FILE
                         Target only these users for AS-REP roasting
   --rc4-only            Force RC4 for Kerberoasting
   --no-roast            Report roastable users without requesting tickets
   --jitter JITTER       Delay (seconds) jitter for roasting requests (evasion)
   --spider-shares       Recursively list files on accessible SMB shares (anonymous)
-
-Usability:
-  --quiet               Suppress console output, log to file
 
 Examples:
   Anonymous scan:
@@ -106,7 +102,7 @@ Examples:
     python ad-reaper.py 10.10.10.10 -u corp.local/jdavis -p Winter2025 --users-file interesting_users.txt --rc4-only
 
   PTH + output dir:
-    python ad-reaper.py 10.10.10.10 -u Administrator -H aad3b...:31d6... --output-dir loot --dump-hashes
+    python ad-reaper.py 10.10.10.10 -u Administrator -H aad3b...:31d6... --output loot
 ```
 
 ## OpSec
