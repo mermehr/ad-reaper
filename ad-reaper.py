@@ -268,10 +268,10 @@ class GetUserSPNs:
                     cipher_text = decoded['ticket']['enc-part']['cipher'].asOctets()
 
                     if etype == 23:
-                        entry = f"$krb5tgs$23$*{user}${self.effective_domain}$*~{user}*$" \
+                        entry = f"$krb5tgs$23$*{user}${self.effective_domain.upper()}${self.effective_domain.upper()}/{user}*$" \
                                 f"{hexlify(cipher_text[:16]).decode()}${hexlify(cipher_text[16:]).decode()}"
                     elif etype in (17, 18):
-                        entry = f"$krb5tgs${etype}$*{user}${self.effective_domain}$*~{user}*$" \
+                        entry = f"$krb5tgs${etype}$*{user}${self.effective_domain.upper()}${self.effective_domain.upper()}/{user}*$" \
                                 f"{hexlify(cipher_text[-12:]).decode()}${hexlify(cipher_text[:-12]).decode()}"
                     else:
                         print_error(f"Skipping unsupported etype {etype} for {user}")
@@ -386,6 +386,8 @@ def check_smb_null_session(target_ip, spider_shares=False):
                     # Ignore error if the session was already deleted by the server
                     if e.getErrorCode() != STATUS_USER_SESSION_DELETED:
                         raise
+                except Exception:
+                    pass
 
     print_fail("FAILED: Anonymous SMB login is NOT allowed or no user could list shares.")
     return found_sensitive_file
