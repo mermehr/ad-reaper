@@ -44,6 +44,8 @@ The tool now includes a suggestions engine. Based on the scan findings, it gener
 - **NetExec/Kerbrute** (if user enumeration failed)
 - **Evil-WinRM/PsExec** (if LAPS or Admin access is found)
 
+---
+
 ## Installation
 
 1. Clone the repository:
@@ -105,6 +107,8 @@ Examples:
     python ad-reaper.py 10.10.10.10 -u Administrator -H aad3b...:31d6... --output loot
 ```
 
+---
+
 ## OpSec
 
 **This tool is loud.**
@@ -119,6 +123,14 @@ Examples:
 
 Pull requests are welcome. This tool was built to handle the "nuances" of different Windows Server configurations. If you find it fails on a specific box, feel free to open an issue or PR.
 
+---
+
 ## Preview
 
-![session](https://raw.githubusercontent.com/mermehr/media/main/2026/01/upgit_20260117_1768657485.gif)
+**Anonymous:**
+
+![anon](assets/anon.gif)
+
+**Authorized:**
+
+![auth](assets/auth.gif)
