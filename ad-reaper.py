@@ -392,7 +392,7 @@ def check_smb_null_session(target_ip, spider_shares=False):
     print_fail("FAILED: Anonymous SMB login is NOT allowed or no user could list shares.")
     return found_sensitive_file
 
-def query_ldap_anonymous(target_ip):
+def query_ldap_anonymous(target_ip, output_dir=None):
     """
     Attempts to bind anonymously to LDAP to retrieve the default naming context,
     domain information, and enumerate users/SPNs if permitted.
@@ -447,20 +447,33 @@ def query_ldap_anonymous(target_ip):
                 else:
                     print(f"  - {Style.CYAN}{attr_formatted}:{Style.RESET} {value}")
 
-        print_info("Querying for active, non-system user accounts...")
-        real_users_filter = f'(&(objectClass=person)(!(objectClass=computer))(!(userAccountControl:1.2.840.113556.1.4.803:={UF_ACCOUNTDISABLE}))(!(sAMAccountName=HealthMailbox*)))'
-        conn.search(domain_dn, real_users_filter, SUBTREE, attributes=['sAMAccountName', 'description'])
+        raw_file = Path(output_dir) / "ldap_users_raw.txt" if output_dir else None
+        if raw_file and raw_file.exists():
+            print_info(f"Skipping LDAP user enum (Found {raw_file})")
+            with open(raw_file, 'r') as f:
+                for line in f:
+                    parts = line.strip().split('|', 1)
+                    if parts and parts[0].strip():
+                        user_list.append(parts[0].strip())
+        else:
+            print_info("Querying for active, non-system user accounts...")
+            real_users_filter = f'(&(objectClass=person)(!(objectClass=computer))(!(userAccountControl:1.2.840.113556.1.4.803:={UF_ACCOUNTDISABLE}))(!(sAMAccountName=HealthMailbox*)))'
+            conn.search(domain_dn, real_users_filter, SUBTREE, attributes=['sAMAccountName', 'description'])
 
-        if conn.entries:
-            print_success("Found active users via LDAP:")
-            print(f"{Style.YELLOW}{'Username':<25} {'Description'}{Style.RESET}")
-            print(f"{'-'*25} {'-'*40}")
-            for entry in conn.entries:
-                username = entry.sAMAccountName.value
-                desc = entry.description.value or 'N/A'
-                if username:
-                    user_list.append(username)
-                    print(f"{Style.YELLOW}{username:<25}{Style.RESET} {desc}")
+            if conn.entries:
+                print_success("Found active users via LDAP:")
+                print(f"{Style.YELLOW}{'Username':<25} {'Description'}{Style.RESET}")
+                print(f"{'-'*25} {'-'*40}")
+                
+                f_raw = open(raw_file, 'w') if raw_file else None
+                for entry in conn.entries:
+                    username = entry.sAMAccountName.value
+                    desc = entry.description.value or 'N/A'
+                    if username:
+                        user_list.append(username)
+                        print(f"{Style.YELLOW}{username:<25}{Style.RESET} {desc}")
+                        if f_raw: f_raw.write(f"{username} | {desc}\n")
+                if f_raw: f_raw.close()
 
         print_info("Querying for users with Service Principal Names (SPNs)...")
         spn_filter = '(&(objectClass=user)(servicePrincipalName=*)(!(sAMAccountName=krbtgt)))'
@@ -513,10 +526,21 @@ def query_ldap_anonymous(target_ip):
 
     return domain_dn, user_list, spn_list 
 
-def enumerate_users_samr(target_ip):
+def enumerate_users_samr(target_ip, output_dir=None):
     """
     Enumerates non-junk domain users via the SAMR RPC interface.
     """
+    raw_file = Path(output_dir) / "samr_users_raw.txt" if output_dir else None
+    if raw_file and raw_file.exists():
+        print_info(f"Skipping SAMR enum (Found {raw_file})")
+        user_list = []
+        with open(raw_file, 'r') as f:
+            for line in f:
+                parts = line.strip().split('|')
+                if parts and parts[0].strip():
+                    user_list.append(parts[0].strip())
+        return user_list
+
     print_info("Enumerating all domain users via SAMR...")
     for user in ['', '.']:
         try:
@@ -562,6 +586,10 @@ def enumerate_users_samr(target_ip):
             print_success(f"SUCCESS: SAMR enumeration with user '{user}' is ALLOWED!")
             print_success(f"Found {len(user_list)} non-junk users via SAMR:")
             if user_list:
+                if raw_file:
+                    with open(raw_file, 'w') as f:
+                        for username, rid in user_list:
+                            f.write(f"{username} | {rid}\n")
                 for username, rid in user_list:
                     print(f"{Style.YELLOW}{username:<25}{Style.RESET} (RID: {hex(rid)})")
                 # Return only the usernames for the master list
@@ -717,7 +745,7 @@ def enumerate_smb_shares_auth(target_ip, domain, username, password, lmhash, nth
     except Exception as e:
         print_fail(f"Connection Error: {e}")
 
-def enumerate_ldap_auth(target_ip, domain, username, password, lmhash, nthash):
+def enumerate_ldap_auth(target_ip, domain, username, password, lmhash, nthash, output_dir=None):
     """
     Performs a comprehensive, authenticated LDAP enumeration.
     Returns the domain's search_base, a list of the user's groups, and a
@@ -727,6 +755,7 @@ def enumerate_ldap_auth(target_ip, domain, username, password, lmhash, nthash):
     print_section("Authenticated LDAP Enumeration")
     user_dn = f"{domain}\\{username}" if domain else username
     user_groups = []
+    user_list = []
     search_base = None
     findings = {'spns': [], 'admin_users': []}
 
@@ -741,7 +770,7 @@ def enumerate_ldap_auth(target_ip, domain, username, password, lmhash, nthash):
             print_info(f"Target Domain: {search_base}")
         else:
             print_fail("Could not determine DefaultNamingContext.")
-            return None, [], findings
+            return None, [], findings, []
 
         print_info(f"Querying groups for user '{username}'...")
         conn.search(search_base, f'(sAMAccountName={username})', attributes=['memberOf', 'primaryGroupID'])
@@ -764,20 +793,32 @@ def enumerate_ldap_auth(target_ip, domain, username, password, lmhash, nthash):
                          print(f"    - {primary_group_name} (Primary Group)")
                          user_groups.append(primary_group_name)
 
-        print_info("Querying for active, non-system user accounts...")
-        real_users_filter = '(& (objectClass=person) (!(objectClass=computer)) (!(userAccountControl:1.2.840.113556.1.4.803:=2)) (!(sAMAccountName=HealthMailbox*)))'
-        real_users_filter = f'(& (objectClass=person) (!(objectClass=computer)) (!(userAccountControl:1.2.840.113556.1.4.803:={UF_ACCOUNTDISABLE})) (!(sAMAccountName=HealthMailbox*)))'
-        conn.search(search_base, real_users_filter, search_scope=SUBTREE, attributes=['sAMAccountName', 'description'], size_limit=0)
-        if conn.entries:
-            print(f"{Style.YELLOW}{'Username':<25} {'Description'}{Style.RESET}")
-            print(f"{'-'*25} {'-'*40}")
-            for entry in conn.entries:
-                u_name = entry.sAMAccountName.value
-                desc = entry.description.value or 'N/A'
-                if u_name:
-                    print(f"{Style.YELLOW}{u_name:<25}{Style.RESET} {desc}")
+        raw_file = Path(output_dir) / "ldap_users_raw.txt" if output_dir else None
+        if raw_file and raw_file.exists():
+            print_info(f"Skipping LDAP user enum (Found {raw_file})")
+            with open(raw_file, 'r') as f:
+                for line in f:
+                    parts = line.strip().split('|', 1)
+                    if parts and parts[0].strip():
+                        user_list.append(parts[0].strip())
         else:
-            print_info("  No active users found with this filter.")
+            print_info("Querying for active, non-system user accounts...")
+            real_users_filter = f'(& (objectClass=person) (!(objectClass=computer)) (!(userAccountControl:1.2.840.113556.1.4.803:={UF_ACCOUNTDISABLE})) (!(sAMAccountName=HealthMailbox*)))'
+            conn.search(search_base, real_users_filter, search_scope=SUBTREE, attributes=['sAMAccountName', 'description'], size_limit=0)
+            if conn.entries:
+                print(f"{Style.YELLOW}{'Username':<25} {'Description'}{Style.RESET}")
+                print(f"{'-'*25} {'-'*40}")
+                f_raw = open(raw_file, 'w') if raw_file else None
+                for entry in conn.entries:
+                    u_name = entry.sAMAccountName.value
+                    desc = entry.description.value or 'N/A'
+                    if u_name:
+                        user_list.append(u_name)
+                        print(f"{Style.YELLOW}{u_name:<25}{Style.RESET} {desc}")
+                        if f_raw: f_raw.write(f"{u_name} | {desc}\n")
+                if f_raw: f_raw.close()
+            else:
+                print_info("  No active users found with this filter.")
 
         print_info("Querying for high-value Server objects...")
         server_filter = '(&(objectClass=computer)(operatingSystem=*Server*))'
@@ -822,14 +863,14 @@ def enumerate_ldap_auth(target_ip, domain, username, password, lmhash, nthash):
                     print(f"    - {Style.YELLOW}{entry.sAMAccountName.value}{Style.RESET}")
 
         conn.unbind()
-        return search_base, user_groups, findings
+        return search_base, user_groups, findings, user_list
 
     except LDAPSocketOpenError:
         print_fail(f"Could not connect to LDAP port 389 on {target_ip}")
     except Exception as e:
         print_fail(f"LDAP Error: {e}")
 
-    return search_base, user_groups, findings
+    return search_base, user_groups, findings, user_list
 
 def find_ad_misconfigs_auth(target_ip, domain, username, password, lmhash, nthash, search_base):
     """
@@ -847,15 +888,14 @@ def find_ad_misconfigs_auth(target_ip, domain, username, password, lmhash, nthas
         server = Server(target_ip, get_info=ALL)
         conn = Connection(server, user=user_dn, password=password if password else None, authentication=NTLM, auto_bind=True)
 
-        print_info("Checking for accounts with Unconstrained Delegation...")
-        delegation_filter = '(|(userAccountControl:1.2.840.113556.1.4.803:=524288)(samAccountType=805306369))'
+        print_info("Checking for user accounts with Unconstrained Delegation...")
+        delegation_filter = '(&(userAccountControl:1.2.840.113556.1.4.803:=524288)(!(objectClass=computer)))'
         conn.search(search_base, delegation_filter, attributes=['sAMAccountName', 'objectClass'], paged_size=500)  # Paged
         if not conn.entries:
-            print_secure("  -> No accounts with Unconstrained Delegation found.")
+            print_secure("  -> No user accounts with Unconstrained Delegation found.")
         else:
             for entry in conn.entries:
-                obj_type = "Computer" if 'computer' in entry.objectClass else "User"
-                print_success(f"  -> VULNERABLE: {entry.sAMAccountName.value} ({obj_type}) has Unconstrained Delegation!")
+                print_success(f"  -> VULNERABLE: {entry.sAMAccountName.value} (User) has Unconstrained Delegation!")
                 findings['unconstrained_delegation'].append(entry.sAMAccountName.value)
 
         print_info("Checking for readable LAPS passwords...")
@@ -991,14 +1031,14 @@ def run_anonymous_scan(target_ip, users_file=None, hash_format='hashcat', output
     findings['sensitive_files_found'] = check_smb_null_session(target_ip, spider_shares)
 
     print_section("LDAP Anonymous Enumeration")
-    domain_dn, ldap_users, spns = query_ldap_anonymous(target_ip)
+    domain_dn, ldap_users, spns = query_ldap_anonymous(target_ip, output_dir)
     findings['domain_dn'] = domain_dn
     findings['spns'] = spns
     if domain_dn:
         findings['domain_name'] = dn_to_dns(domain_dn)
 
     print_section("SAMR Anonymous Enumeration")
-    samr_users = enumerate_users_samr(target_ip)
+    samr_users = enumerate_users_samr(target_ip, output_dir)
 
     master_user_set = set(ldap_users) | set(samr_users)
     if master_user_set and output_dir:
@@ -1048,7 +1088,14 @@ def run_authenticated_scan(target_ip, username, password, lmhash, nthash, domain
             sys.exit(1)
 
 
-    search_base, user_groups, ldap_findings = enumerate_ldap_auth(target_ip, domain, user, password, lmhash, nthash)
+    search_base, user_groups, ldap_findings, user_list = enumerate_ldap_auth(target_ip, domain, user, password, lmhash, nthash, output_dir)
+    
+    if user_list and output_dir:
+        with open(Path(output_dir) / "ad_users.txt", "w") as f:
+            for u in sorted(user_list):
+                f.write(f"{u}\n")
+        print_info("Full user list saved to ad_users.txt")
+
     findings.update(ldap_findings)
     if search_base:
         misconfig_findings = find_ad_misconfigs_auth(target_ip, domain, username, password, lmhash, nthash, search_base)
