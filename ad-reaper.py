@@ -17,12 +17,16 @@ remote access pathways, and common AD misconfigurations.
 """
 
 import sys
+import os
 import argparse
 import ipaddress
 import socket
 import datetime
 import random
 import time
+import hashlib
+import tempfile
+import subprocess
 from binascii import hexlify, unhexlify
 from pathlib import Path
 
@@ -66,6 +70,63 @@ def print_section(title):
     print("\n" + "="*70)
     print(f" {title.upper()} ".center(70, "="))
     print("="*70 + "\n")
+
+# ---- Openssl Patch ----
+
+def ensure_legacy_provider():
+    """
+    Attempts to enable the OpenSSL legacy provider if MD4 is missing.
+    This is required when running in a virtual enviroment.
+    """
+    try:
+        hashlib.new('md4')
+        return
+    except ValueError:
+        pass
+
+    if "REAPER_OPENSSL_PATCHED" in os.environ:
+        return
+
+    std_paths = ["/etc/ssl/openssl.cnf", "/etc/pki/tls/openssl.cnf", "/usr/lib/ssl/openssl.cnf"]
+    base_cnf = next((p for p in std_paths if os.path.exists(p)), None)
+    
+    if not base_cnf:
+        return
+    legacy_cnf_content = f"""
+.include {base_cnf}
+
+[openssl_init]
+providers = provider_sect
+
+[provider_sect]
+default = default_sect
+legacy = legacy_sect
+
+[default_sect]
+activate = 1
+
+[legacy_sect]
+activate = 1
+"""
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.cnf', delete=False) as tmp:
+            tmp.write(legacy_cnf_content)
+            tmp_path = tmp.name
+
+        env = os.environ.copy()
+        env["OPENSSL_CONF"] = tmp_path
+        env["REAPER_OPENSSL_PATCHED"] = "1"
+
+        result = subprocess.run([sys.executable] + sys.argv, env=env)
+        
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+            
+        sys.exit(result.returncode)
+    except Exception:
+        return
+
+ensure_legacy_provider()
 
 # ---- Helpers ----
 
