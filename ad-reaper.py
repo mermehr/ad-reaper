@@ -23,7 +23,6 @@ import socket
 import datetime
 import random
 import time
-import os
 from binascii import hexlify, unhexlify
 from pathlib import Path
 
@@ -291,6 +290,37 @@ class GetUserSPNs:
 
 # ---- Core enumeration functions ----
 
+def spider_smb_share(conn, share, path='\\', max_depth=5, current_depth=0):
+    """Recursively lists files and directories in a given path."""
+    found_sensitive = False
+    SENSITIVE_EXTS = ('.xml', '.txt', '.ini', '.config', '.kdbx', '.toml', '.cfg', '.pdf')
+
+    if current_depth > max_depth:
+        return False
+
+    try:
+        files = conn.listPath(share, path + "*")
+        for f in files:
+            filename = f.get_longname()
+            if filename in ('.', '..'): continue
+
+            is_dir = f.get_attributes() & FILE_ATTRIBUTE_DIRECTORY
+            full_path = f"{path}{filename}"
+
+            if is_dir:
+                print(f"      > {Style.CYAN}{full_path}/{Style.RESET}")
+                if spider_smb_share(conn, share, full_path + "\\", max_depth, current_depth + 1):
+                    found_sensitive = True
+            else:
+                if filename.lower().endswith(SENSITIVE_EXTS) or 'password' in filename.lower():
+                    print_vuln(f"      > {full_path} (SENSITIVE)")
+                    found_sensitive = True
+                else:
+                    print(f"      > {full_path}")
+    except:
+        pass
+    return found_sensitive
+
 def check_smb_null_session(target_ip, spider_shares=False):
     """
     Checks for an SMB null session, lists shares, and enumerates files.
@@ -298,43 +328,6 @@ def check_smb_null_session(target_ip, spider_shares=False):
     """
     found_sensitive_file = False
     SHARES_TO_SKIP = ('IPC$', 'PRINT$')
-    SENSITIVE_EXTS = ('.xml', '.txt', '.ini', '.config', '.kdbx', '.toml', '.cfg', '.pdf')
-
-    def list_smb_path(conn, share, path, max_depth=5, current_depth=0):  # Depth limit to prevent stack overflow
-        if current_depth > max_depth:
-            print_error(f"Max depth reached for {path} - skipping deeper recursion")
-            return
-
-        nonlocal found_sensitive_file
-        r"""
-        Recursively lists files and directories in a given path.
-        'path' should be a directory, e.g., r'\' or r'\dir1\'
-        """
-        query_path = f"{path}*"
-        try:
-            files = conn.listPath(share, query_path)
-            for f in files:
-                filename = f.get_longname()
-                is_dir = f.get_attributes() & FILE_ATTRIBUTE_DIRECTORY
-                full_print_path = f"{path}{filename}"
-
-                if filename in ('.', '..'):
-                    continue
-
-                if is_dir:
-                    print(f"  > {Style.CYAN}{full_print_path}/{Style.RESET}")
-                    list_smb_path(conn, share, f"{path}{filename}\\", max_depth, current_depth + 1)
-                else:
-                    if filename.lower().endswith(SENSITIVE_EXTS) or 'password' in filename.lower():
-                        print_vuln(f"  > {full_print_path}  (SENSITIVE FILE)")
-                        found_sensitive_file = True
-                    else:
-                        print(f"  > {full_print_path}")
-        except SessionError as e:
-            if e.getErrorCode() == STATUS_ACCESS_DENIED:
-                print_error(f"  > {query_path} (Access Denied)")
-            else:
-                print_error(f"  > Error listing {query_path}: {e}")
 
     print_info("Checking for anonymous SMB login and share listing (port 445)...")
     for user in ['', '.', 'anonymous', 'guest']:  # Null session users
@@ -349,18 +342,41 @@ def check_smb_null_session(target_ip, spider_shares=False):
 
             print(f"  {Style.CYAN}{'Share Name':<20} {'Comment'}{Style.RESET}")
             print(f"  {'-'*20} {'-'*30}")
+            discovered_shares = []
             for share in shares:
-                print(f"  {share['shi1_netname'][:-1]:<20} {share['shi1_remark'][:-1]}")
+                name = share['shi1_netname'][:-1]
+                print(f"  {name:<20} {share['shi1_remark'][:-1]}")
+                discovered_shares.append(name)
 
-            if spider_shares:
-                for share in shares:
-                    share_name = share['shi1_netname'][:-1]
-                    if share_name in SHARES_TO_SKIP:
-                        continue
-                    print(f"\n--- Scanning Share: {Style.CYAN}{share_name}{Style.RESET} ---")
-                    list_smb_path(conn, share_name, "\\")
-            else:
-                print_info("Recursive file discovery disabled (use --spider-shares to enable).")
+            print_info("\n  Checking for read/write access on discovered shares...")
+            for share_name in discovered_shares:
+                if share_name in SHARES_TO_SKIP:
+                    continue
+
+                access_summary = []
+                can_read = False
+                try:
+                    conn.listPath(share_name, '\\*')
+                    access_summary.append(f"{Style.GREEN}READ{Style.RESET}")
+                    can_read = True
+                except SessionError:
+                    access_summary.append(f"{Style.RED}NO READ{Style.RESET}")
+
+                try:
+                    temp_file = 'ad-reaper-test.tmp'
+                    tid, fid = conn.createFile(share_name, temp_file)
+                    conn.closeFile(tid, fid)
+                    conn.deleteFile(share_name, temp_file)
+                    access_summary.append(f"{Style.RED}WRITE{Style.RESET}")
+                except SessionError:
+                    access_summary.append(f"{Style.RED}NO WRITE{Style.RESET}")
+                
+                print(f"    -> {share_name:<15} Access: [{', '.join(access_summary)}]")
+
+                if spider_shares and can_read:
+                    print(f"\n    --- Scanning Share: {Style.CYAN}{share_name}{Style.RESET} ---")
+                    if spider_smb_share(conn, share_name):
+                        found_sensitive_file = True
 
             return found_sensitive_file
 
@@ -690,7 +706,7 @@ def get_domain_from_ldap(target_ip):
 
 # ---- Authenticated Functions ----
 
-def enumerate_smb_shares_auth(target_ip, domain, username, password, lmhash, nthash):
+def enumerate_smb_shares_auth(target_ip, domain, username, password, lmhash, nthash, spider_shares=False):
     """Connects to SMB with credentials and lists accessible shares."""
     print_section("Authenticated SMB Share Enumeration")
     try:
@@ -716,10 +732,12 @@ def enumerate_smb_shares_auth(target_ip, domain, username, password, lmhash, nth
                 continue
 
             access_summary = []
+            can_read = False
             # Test for READ access
             try:
                 conn.listPath(share_name, '\\*')
                 access_summary.append(f"{Style.GREEN}READ{Style.RESET}")
+                can_read = True
             except SessionError:
                 access_summary.append(f"{Style.RED}NO READ{Style.RESET}")
 
@@ -735,6 +753,10 @@ def enumerate_smb_shares_auth(target_ip, domain, username, password, lmhash, nth
                 access_summary.append(f"{Style.RED}NO WRITE{Style.RESET}")
             
             print(f"    -> {share_name:<15} Access: [{', '.join(access_summary)}]")
+
+            if spider_shares and can_read:
+                print(f"\n    --- Scanning Share: {Style.CYAN}{share_name}{Style.RESET} ---")
+                spider_smb_share(conn, share_name)
 
         conn.logoff()
     except SessionError as e:
@@ -773,7 +795,7 @@ def enumerate_ldap_auth(target_ip, domain, username, password, lmhash, nthash, o
             return None, [], findings, []
 
         print_info(f"Querying groups for user '{username}'...")
-        conn.search(search_base, f'(sAMAccountName={username})', attributes=['memberOf', 'primaryGroupID'])
+        conn.search(search_base, f'(sAMAccountName={username})', attributes=['memberOf', 'primaryGroupID', 'msDS-AllowedToDelegateTo'])
         if conn.entries:
             entry = conn.entries[0]
             primary_group_id = entry.primaryGroupID.value if 'primaryGroupID' in entry else None
@@ -792,33 +814,57 @@ def enumerate_ldap_auth(target_ip, domain, username, password, lmhash, nthash, o
                     if primary_group_name not in user_groups:
                          print(f"    - {primary_group_name} (Primary Group)")
                          user_groups.append(primary_group_name)
+            
+            if 'msDS-AllowedToDelegateTo' in entry and entry['msDS-AllowedToDelegateTo']:
+                print_vuln(f"  User '{username}' has Explicit Delegation rights (msDS-AllowedToDelegateTo):")
+                for target in entry['msDS-AllowedToDelegateTo']:
+                    print(f"    - {target}")
 
         raw_file = Path(output_dir) / "ldap_users_raw.txt" if output_dir else None
+        existing_users = set()
         if raw_file and raw_file.exists():
-            print_info(f"Skipping LDAP user enum (Found {raw_file})")
+            print_info(f"Loading existing users from {raw_file}...")
             with open(raw_file, 'r') as f:
                 for line in f:
                     parts = line.strip().split('|', 1)
                     if parts and parts[0].strip():
-                        user_list.append(parts[0].strip())
-        else:
-            print_info("Querying for active, non-system user accounts...")
-            real_users_filter = f'(& (objectClass=person) (!(objectClass=computer)) (!(userAccountControl:1.2.840.113556.1.4.803:={UF_ACCOUNTDISABLE})) (!(sAMAccountName=HealthMailbox*)))'
-            conn.search(search_base, real_users_filter, search_scope=SUBTREE, attributes=['sAMAccountName', 'description'], size_limit=0)
-            if conn.entries:
-                print(f"{Style.YELLOW}{'Username':<25} {'Description'}{Style.RESET}")
-                print(f"{'-'*25} {'-'*40}")
-                f_raw = open(raw_file, 'w') if raw_file else None
-                for entry in conn.entries:
-                    u_name = entry.sAMAccountName.value
-                    desc = entry.description.value or 'N/A'
-                    if u_name:
-                        user_list.append(u_name)
+                        u = parts[0].strip()
+                        existing_users.add(u)
+                        user_list.append(u)
+
+        print_info("Querying for active, non-system user accounts...")
+        real_users_filter = f'(& (objectClass=person) (!(objectClass=computer)) (!(userAccountControl:1.2.840.113556.1.4.803:={UF_ACCOUNTDISABLE})) (!(sAMAccountName=HealthMailbox*)))'
+        conn.search(search_base, real_users_filter, search_scope=SUBTREE, attributes=['sAMAccountName', 'description'], size_limit=0)
+        
+        if conn.entries:
+            new_users_found = False
+            f_raw = open(raw_file, 'a') if raw_file else None
+            
+            for entry in conn.entries:
+                u_name = entry.sAMAccountName.value
+                desc = entry.description.value or 'N/A'
+                if u_name:
+                    if u_name not in existing_users:
+                        if not new_users_found:
+                            print_success("Found NEW active users via authenticated LDAP:")
+                            print(f"{Style.YELLOW}{'Username':<25} {'Description'}{Style.RESET}")
+                            print(f"{'-'*25} {'-'*40}")
+                            new_users_found = True
+                        
                         print(f"{Style.YELLOW}{u_name:<25}{Style.RESET} {desc}")
+                        user_list.append(u_name)
+                        existing_users.add(u_name)
                         if f_raw: f_raw.write(f"{u_name} | {desc}\n")
-                if f_raw: f_raw.close()
-            else:
-                print_info("  No active users found with this filter.")
+            
+            if f_raw: f_raw.close()
+            
+            if not new_users_found:
+                if existing_users:
+                    print_info("  No new users found (synced with existing dump).")
+                else:
+                    print_info("  No active users found with this filter.")
+        else:
+            print_info("  No active users found with this filter.")
 
         print_info("Querying for high-value Server objects...")
         server_filter = '(&(objectClass=computer)(operatingSystem=*Server*))'
@@ -1027,9 +1073,7 @@ def run_anonymous_scan(target_ip, users_file=None, hash_format='hashcat', output
     SAMR enumeration, and AS-REP roasting check.
     """
     findings = {}
-    print_section("SMB Anonymous Enumeration")
-    findings['sensitive_files_found'] = check_smb_null_session(target_ip, spider_shares)
-
+    
     print_section("LDAP Anonymous Enumeration")
     domain_dn, ldap_users, spns = query_ldap_anonymous(target_ip, output_dir)
     findings['domain_dn'] = domain_dn
@@ -1049,6 +1093,9 @@ def run_anonymous_scan(target_ip, users_file=None, hash_format='hashcat', output
     else:
         findings['no_users_found'] = True
 
+    print_section("SMB Anonymous Enumeration")
+    findings['sensitive_files_found'] = check_smb_null_session(target_ip, spider_shares)
+
     print_section("AS-REP Roasting Check")
     user_list = list(master_user_set)
     if users_file:
@@ -1064,7 +1111,7 @@ def run_anonymous_scan(target_ip, users_file=None, hash_format='hashcat', output
         print_error("Kerberoasting requires auth creds - skipping in anonymous mode")
     return findings
 
-def run_authenticated_scan(target_ip, username, password, lmhash, nthash, domain=None, hash_format='hashcat', output_dir=None, rc4_only=False, no_roast=False, jitter=0):
+def run_authenticated_scan(target_ip, username, password, lmhash, nthash, domain=None, hash_format='hashcat', output_dir=None, rc4_only=False, no_roast=False, jitter=0, spider_shares=False):
     """
     Orchestrates the authenticated scanning modules: LDAP enumeration, SMB shares,
     misconfiguration checks, and Kerberoasting.
@@ -1102,7 +1149,7 @@ def run_authenticated_scan(target_ip, username, password, lmhash, nthash, domain
         findings.update(misconfig_findings)
         findings['domain_name'] = dn_to_dns(search_base)
 
-    enumerate_smb_shares_auth(target_ip, domain, user, password, lmhash, nthash)
+    enumerate_smb_shares_auth(target_ip, domain, user, password, lmhash, nthash, spider_shares)
 
     check_access_paths_auth(target_ip, user_groups, user, password, lmhash, nthash, domain)
 
@@ -1230,7 +1277,7 @@ Examples:
     g.add_argument("--rc4-only",         action="store_true", help="Force RC4 for Kerberoasting")
     g.add_argument("--no-roast",         action="store_true", help="Report roastable users without requesting tickets")
     g.add_argument("--jitter",           type=float, default=0, help="Delay (seconds) jitter for roasting requests (evasion)")
-    g.add_argument("--spider-shares",    action="store_true", help="Recursively list files on accessible SMB shares (anonymous)")
+    g.add_argument("--spider-shares",    action="store_true", help="Recursively list files on accessible SMB shares")
 
 
     args = parser.parse_args()
@@ -1276,7 +1323,7 @@ Examples:
 
         print_section(f"Authenticated Scan → {args.target} @ {domain}\\{args.username.split('/')[-1]}")
 
-        findings = run_authenticated_scan(args.target, args.username, pw, lmh, nth, domain, args.hash_format, outdir, args.rc4_only, args.no_roast, args.jitter)
+        findings = run_authenticated_scan(args.target, args.username, pw, lmh, nth, domain, args.hash_format, outdir, args.rc4_only, args.no_roast, args.jitter, args.spider_shares)
         auth_creds = {'username': args.username, 'password': pw, 'lmhash': lmh, 'nthash': nth}
         print_suggestions(args.target, findings, auth_creds)
     else:
