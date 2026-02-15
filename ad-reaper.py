@@ -76,7 +76,7 @@ def print_section(title):
 def ensure_legacy_provider():
     """
     Attempts to enable the OpenSSL legacy provider if MD4 is missing.
-    This is required when running in a virtual enviroment.
+    This may required when running in a virtual enviroment.
     """
     try:
         hashlib.new('md4')
@@ -995,14 +995,17 @@ def find_ad_misconfigs_auth(target_ip, domain, username, password, lmhash, nthas
         server = Server(target_ip, get_info=ALL)
         conn = Connection(server, user=user_dn, password=password if password else None, authentication=NTLM, auto_bind=True)
 
-        print_info("Checking for user accounts with Unconstrained Delegation...")
-        delegation_filter = '(&(userAccountControl:1.2.840.113556.1.4.803:=524288)(!(objectClass=computer)))'
+        print_info("Checking for accounts with Unconstrained Delegation...")
+        delegation_filter = '(userAccountControl:1.2.840.113556.1.4.803:=524288)'
         conn.search(search_base, delegation_filter, attributes=['sAMAccountName', 'objectClass'], paged_size=500)  # Paged
         if not conn.entries:
-            print_secure("  -> No user accounts with Unconstrained Delegation found.")
+            print_secure("  -> No accounts with Unconstrained Delegation found.")
         else:
             for entry in conn.entries:
-                print_success(f"  -> VULNERABLE: {entry.sAMAccountName.value} (User) has Unconstrained Delegation!")
+                obj_type = "User"
+                if 'computer' in [x.lower() for x in entry.objectClass.value]:
+                    obj_type = "Computer"
+                print_success(f"  -> VULNERABLE: {entry.sAMAccountName.value} ({obj_type}) has Unconstrained Delegation!")
                 findings['unconstrained_delegation'].append(entry.sAMAccountName.value)
 
         print_info("Checking for readable LAPS passwords...")
