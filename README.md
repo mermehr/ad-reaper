@@ -1,8 +1,12 @@
 # AD-Reaper
 
-A comprehensive Active Directory enumeration tool.
+A comprehensive multi-protocol Active Directory (LDAP, SMB, SAMR) enumeration tool.
 
 `AD-Reaper` helps with from getting an **initial foothold** (finding null sessions) to **authenticated auditing** (finding privilege escalation paths). It combines anonymous enumeration techniques with deeper authenticated scanning and post-scan analysis.
+
+**Not a wrapper**, no external tooling needed. Script relies on `impacket` and `ldap3` libraries for enumeration, `pyasn1` library for handling structure and serialization of data.
+
+Designed to capture and report low hanging fruit fast, with very few dependencies.
 
 ## Modes & Features
 
@@ -10,16 +14,14 @@ A comprehensive Active Directory enumeration tool.
 - **Share Auditing:** Checks permissions across all discovered shares and attempts to identify writeable directories.
 - **Recursive SMB Walking:** Walks directories to find sensitive files (e.g., `web.config`, `passwords.txt`) if the `--spider-shares` flag is used.
 - **Hybrid User Enumeration:** Generates a master user list by combining anonymous LDAP queries (active users) with RPC/SAMR enumeration (all users/RIDs).
+- **Group Policy & Object Auditing:** Identifies interesting group memberships and misconfiguration. (Auth mode)
 - **Server Object Discovery:** Identifies high-value infrastructure (Domain Controllers, File Servers) via anonymous LDAP queries.
+- **Other AD Checks:** Looks other common misconfigurations that may be exploitable (ACDS, LAPS, admincount, delegations, etc.).
 - **Post-Scan Analysis:** Provides actionable suggestions based on the findings (e.g., reminding you to check for GPP passwords or suggesting specific `secretsdump` targets).
 - **AS-REP Roasting:** Automatically tests the discovered user list for accounts that do not require Kerberos pre-authentication and dumps the hashes. (Anon mode)
 - **Kerberoasting:** Automatically identifies service accounts (SPNs) and requests TGS tickets for offline cracking. (Auth mode)
-- **Group Policy & Object Auditing:** Identifies interesting group memberships and misconfiguration. (Auth mode)
-- **Other AD Checks:** Looks for misconfigurations that may be exploitable (ACDS, LAPS, admincount, delegations, etc.).
 
 ## Installation
-
-Script only requires system `openssl` (should be in core for most systems). Python dependencies handled via pip.
 
 1. Clone the repository:
 
