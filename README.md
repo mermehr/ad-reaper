@@ -2,9 +2,11 @@
 
 A comprehensive multi-protocol Active Directory (LDAP, SMB, SAMR) enumeration tool.
 
+Supports python versions (3.12+)
+
 `AD-Reaper` helps with from getting an **initial foothold** (finding null sessions) to **authenticated auditing** (finding privilege escalation paths). It combines anonymous enumeration techniques with deeper authenticated scanning and post-scan analysis.
 
-**Not a wrapper**, no external tooling needed. Script relies on `impacket` and `ldap3` libraries for enumeration, `pyasn1` library for handling structure and serialization of data.
+**Not a wrapper**, packages needed available in pip: `impacket` and `ldap3` libraries for enumeration, `pyasn1` library for handling structure and serialization of data.
 
 Designed to capture and report low hanging fruit fast, with very few dependencies.
 
