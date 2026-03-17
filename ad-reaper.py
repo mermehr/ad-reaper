@@ -1086,7 +1086,7 @@ def print_suggestions(target_ip, findings, auth_creds=None):
         ca_name = adcs_spns_found[0].split('/')[1].split('.')[0] if '/' in adcs_spns_found[0] else 'DEFAULT-CA'
         print("  An SPN for ADCS was found. This indicates the presence of a Certificate Authority.")
         print("  You should enumerate it for misconfigurations (e.g., ESC1, ESC8) using Certipy.")
-        print(f"  > {Style.CYAN}certipy find -u '{auth_creds.get('username', '<user>')}@{domain}' -p '{auth_creds.get('password', '<pass>')}' -dc-ip {target_ip} -ca '{ca_name}'{Style.RESET}\n")
+        print(f"  > {Style.CYAN}certipy find -u '{auth_creds.get('username', '<user>')}@{domain}' -p '{auth_creds.get('password', '<pass>')}' -dc-ip {target_ip} -vulnerable -stdout{Style.RESET}\n")
         suggestions_made = True
 
     if findings.get('unconstrained_delegation'):
