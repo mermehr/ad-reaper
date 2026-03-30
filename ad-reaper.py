@@ -988,7 +988,7 @@ def find_ad_misconfigs_auth(target_ip, domain, username, password, lmhash, nthas
         print_info("Skipping misconfig check (no search_base)")
         return {}
 
-    findings = {'unconstrained_delegation': [], 'laps_readable': []}
+    findings = {'unconstrained_delegation': [], 'constrained_delegation': [], 'laps_readable': []}
     print_section("AD Misconfiguration Check")
     user_dn = f"{domain}\\{username}" if domain else username
     try:
@@ -1007,6 +1007,20 @@ def find_ad_misconfigs_auth(target_ip, domain, username, password, lmhash, nthas
                     obj_type = "Computer"
                 print_success(f"  -> VULNERABLE: {entry.sAMAccountName.value} ({obj_type}) has Unconstrained Delegation!")
                 findings['unconstrained_delegation'].append(entry.sAMAccountName.value)
+
+        print_info("Checking for Users with Constrained Delegation (Outbound Control)...")
+        # Filter for standard users (excluding computers) with constrained delegation configured
+        constrained_filter = '(&(objectClass=user)(!(objectClass=computer))(msDS-AllowedToDelegateTo=*))'
+        conn.search(search_base, constrained_filter, attributes=['sAMAccountName', 'msDS-AllowedToDelegateTo'], paged_size=500)
+        if conn.entries:
+            for entry in conn.entries:
+                u_name = entry.sAMAccountName.value
+                targets = entry['msDS-AllowedToDelegateTo'].value
+                targets_str = ", ".join(targets) if isinstance(targets, list) else str(targets)
+                print_vuln(f"  -> VULNERABLE: User '{u_name}' has Constrained Delegation to: {targets_str}")
+                findings['constrained_delegation'].append({'user': u_name, 'targets': targets})
+        else:
+            print_secure("  -> No standard users found with Constrained Delegation.")
 
         print_info("Checking for readable LAPS passwords...")
         laps_attrs = ['sAMAccountName', 'ms-Mcs-AdmPwd', 'msLAPS-Password']
@@ -1094,6 +1108,13 @@ def print_suggestions(target_ip, findings, auth_creds=None):
         print("  The following accounts can impersonate users on any service on their host.")
         print("  If you gain control of one, you can capture TGTs from incoming authentications (e.g., from Domain Admins).")
         print("  > Consider using tools like BloodHound to visualize attack paths or manually check for printer spooler abuse.\n")
+        suggestions_made = True
+
+    if findings.get('constrained_delegation'):
+        print(f"{Style.YELLOW}[!] Constrained Delegation Found (Outbound Control):{Style.RESET}")
+        print("  The following user accounts can impersonate users to specific backend services.")
+        print("  This can often be abused to escalate privileges or move laterally if the target service is high-value.")
+        print("  > Investigate these accounts for KrbRelayUp or other delegation-based attacks.\n")
         suggestions_made = True
 
     if findings.get('laps_readable'):
