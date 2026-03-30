@@ -18,6 +18,7 @@ remote access pathways, and common AD misconfigurations.
 
 import sys
 import os
+import re
 import argparse
 import ipaddress
 import socket
@@ -129,6 +130,10 @@ activate = 1
 ensure_legacy_provider()
 
 # ---- Helpers ----
+
+def strip_ansi(text):
+    """Remove ANSI escape sequences (colors) from string for clean logging."""
+    return re.sub(r'\x1B\[[0-?]*[ -/]*[@-~]', '', text)
 
 def dn_to_dns(dn):
     """ Convert LDAP DN → DNS name properly """
@@ -351,10 +356,15 @@ class GetUserSPNs:
 
 # ---- Core enumeration functions ----
 
-def spider_smb_share(conn, share, path='\\', max_depth=5, current_depth=0):
+def spider_smb_share(conn, share, path='\\', max_depth=5, current_depth=0, spider_log=None):
     """Recursively lists files and directories in a given path."""
     found_sensitive = False
     SENSITIVE_EXTS = ('.xml', '.txt', '.ini', '.config', '.kdbx', '.toml', '.cfg', '.pdf')
+
+    def log_and_print(msg, level="info"):
+        if level == "vuln": print_vuln(msg)
+        else: print(msg)
+        if spider_log: spider_log.write(strip_ansi(msg) + '\n')
 
     if current_depth > max_depth:
         return False
@@ -369,20 +379,20 @@ def spider_smb_share(conn, share, path='\\', max_depth=5, current_depth=0):
             full_path = f"{path}{filename}"
 
             if is_dir:
-                print(f"      > {Style.CYAN}{full_path}/{Style.RESET}")
-                if spider_smb_share(conn, share, full_path + "\\", max_depth, current_depth + 1):
+                log_and_print(f"      > {Style.CYAN}{full_path}/{Style.RESET}")
+                if spider_smb_share(conn, share, full_path + "\\", max_depth, current_depth + 1, spider_log):
                     found_sensitive = True
             else:
                 if filename.lower().endswith(SENSITIVE_EXTS) or 'password' in filename.lower():
-                    print_vuln(f"      > {full_path} (SENSITIVE)")
+                    log_and_print(f"      > {full_path} (SENSITIVE)", "vuln")
                     found_sensitive = True
                 else:
-                    print(f"      > {full_path}")
+                    log_and_print(f"      > {full_path}")
     except:
         pass
     return found_sensitive
 
-def check_smb_null_session(target_ip, spider_shares=False):
+def check_smb_null_session(target_ip, spider_shares=False, spider_log=None):
     """
     Checks for an SMB null session, lists shares, and enumerates files.
     Returns True if any potentially sensitive files are found, otherwise False.
@@ -390,26 +400,32 @@ def check_smb_null_session(target_ip, spider_shares=False):
     found_sensitive_file = False
     SHARES_TO_SKIP = ('IPC$', 'PRINT$')
 
-    print_info("Checking for anonymous SMB login and share listing (port 445)...")
+    def log_and_print(msg, type="info"):
+        if type == "success": print_success(msg)
+        elif type == "info": print_info(msg)
+        elif type == "error": print_error(msg)
+        if spider_log: spider_log.write(strip_ansi(msg) + '\n')
+
+    log_and_print("Checking for anonymous SMB login and share listing (port 445)...")
     for user in ['', '.', 'anonymous', 'guest']:  # Null session users
         conn = None
         try:
             conn = SMBConnection(target_ip, target_ip, timeout=5)
             conn.login(user, '')
-            print_success(f"SUCCESS: Anonymous SMB login (user: '{user}') is ALLOWED!")
+            log_and_print(f"SUCCESS: Anonymous SMB login (user: '{user}') is ALLOWED!", "success")
 
             shares = conn.listShares()
-            print_info("Enumerating accessible shares...")
+            log_and_print("Enumerating accessible shares...")
 
-            print(f"  {Style.CYAN}{'Share Name':<20} {'Comment'}{Style.RESET}")
-            print(f"  {'-'*20} {'-'*30}")
+            log_and_print(f"  {Style.CYAN}{'Share Name':<20} {'Comment'}{Style.RESET}")
+            log_and_print(f"  {'-'*20} {'-'*30}")
             discovered_shares = []
             for share in shares:
                 name = share['shi1_netname'][:-1]
                 print(f"  {name:<20} {share['shi1_remark'][:-1]}")
                 discovered_shares.append(name)
 
-            print_info("\n  Checking for read/write access on discovered shares...")
+            log_and_print("\n  Checking for read/write access on discovered shares...")
             for share_name in discovered_shares:
                 if share_name in SHARES_TO_SKIP:
                     continue
@@ -432,11 +448,11 @@ def check_smb_null_session(target_ip, spider_shares=False):
                 except SessionError:
                     access_summary.append(f"{Style.RED}NO WRITE{Style.RESET}")
                 
-                print(f"    -> {share_name:<15} Access: [{', '.join(access_summary)}]")
+                log_and_print(f"    -> {share_name:<15} Access: [{', '.join(access_summary)}]")
 
                 if spider_shares and can_read:
-                    print(f"\n    --- Scanning Share: {Style.CYAN}{share_name}{Style.RESET} ---")
-                    if spider_smb_share(conn, share_name):
+                    log_and_print(f"\n    --- Scanning Share: {Style.CYAN}{share_name}{Style.RESET} ---")
+                    if spider_smb_share(conn, share_name, spider_log=spider_log):
                         found_sensitive_file = True
 
             return found_sensitive_file
@@ -767,26 +783,32 @@ def get_domain_from_ldap(target_ip):
 
 # ---- Authenticated Functions ----
 
-def enumerate_smb_shares_auth(target_ip, domain, username, password, lmhash, nthash, spider_shares=False):
+def enumerate_smb_shares_auth(target_ip, domain, username, password, lmhash, nthash, spider_shares=False, spider_log=None):
     """Connects to SMB with credentials and lists accessible shares."""
-    print_section("Authenticated SMB Share Enumeration")
+    def log_and_print(msg, type="info"):
+        if type == "success": print_success(msg)
+        elif type == "info": print_info(msg)
+        elif type == "fail": print_fail(msg)
+        if spider_log: spider_log.write(strip_ansi(msg) + '\n')
+
+    log_and_print(f"\n{'='*70}\n Authenticated SMB Share Enumeration \n{'='*70}")
     try:
         conn = SMBConnection(target_ip, target_ip, timeout=5)
         conn.login(username, password, domain, lmhash=lmhash, nthash=nthash)
-        print_success(f"SMB Auth Successful as {domain}\\{username}")
+        log_and_print(f"SMB Auth Successful as {domain}\\{username}", "success")
 
         shares = conn.listShares()
-        print(f"  {Style.CYAN}{'Share Name':<20} {'Comment'}{Style.RESET}")
-        print(f"  {'-'*20} {'-'*30}")
+        log_and_print(f"  {Style.CYAN}{'Share Name':<20} {'Comment'}{Style.RESET}")
+        log_and_print(f"  {'-'*20} {'-'*30}")
         
         discovered_shares = [s['shi1_netname'][:-1] for s in shares]
         for share_name in discovered_shares:
             # Find the corresponding remark for printing
             remark = next((s['shi1_remark'][:-1] for s in shares if s['shi1_netname'][:-1] == share_name), "")
-            print(f"  {share_name:<20} {remark}")
+            log_and_print(f"  {share_name:<20} {remark}")
 
         # After listing, check for read/write access on all discovered shares.
-        print_info("\n  Checking for read/write access on discovered shares...")
+        log_and_print("\n  Checking for read/write access on discovered shares...")
         SHARES_TO_SKIP_CHECKS = ('IPC$', 'PRINT$')
         for share_name in discovered_shares:
             if share_name in SHARES_TO_SKIP_CHECKS:
@@ -813,20 +835,20 @@ def enumerate_smb_shares_auth(target_ip, domain, username, password, lmhash, nth
             except SessionError:
                 access_summary.append(f"{Style.RED}NO WRITE{Style.RESET}")
             
-            print(f"    -> {share_name:<15} Access: [{', '.join(access_summary)}]")
+            log_and_print(f"    -> {share_name:<15} Access: [{', '.join(access_summary)}]")
 
             if spider_shares and can_read:
-                print(f"\n    --- Scanning Share: {Style.CYAN}{share_name}{Style.RESET} ---")
-                spider_smb_share(conn, share_name)
+                log_and_print(f"\n    --- Scanning Share: {Style.CYAN}{share_name}{Style.RESET} ---")
+                spider_smb_share(conn, share_name, spider_log=spider_log)
 
         conn.logoff()
     except SessionError as e:
         if e.getErrorCode() == STATUS_LOGON_FAILURE:
-            print_fail(f"SMB Login Failed: Invalid Credentials for {username}")
+            log_and_print(f"SMB Login Failed: Invalid Credentials for {username}", "fail")
         else:
-            print_fail(f"SMB Error: {e}")
+            log_and_print(f"SMB Error: {e}", "fail")
     except Exception as e:
-        print_fail(f"Connection Error: {e}")
+        log_and_print(f"Connection Error: {e}", "fail")
 
 def enumerate_ldap_auth(target_ip, domain, username, password, lmhash, nthash, output_dir=None):
     """
@@ -1399,18 +1421,35 @@ Examples:
         sys.stdout = Tee(log_file, 'w')
 
 
+    findings = {}
+    spider_log = None
+    if args.spider_shares and not args.no_logging:
+        spider_log = open(outdir / "smb_spider.txt", 'w')
+
     if is_auth:
         domain = args.domain or ''
         pw   = args.password or ""
         lmh, nth = ("","")
         if args.hashes:
             lmh, nth = parse_hashes(args.hashes)
+        
+        p_domain, user = parse_identity(args.username)
+        domain = domain or p_domain
 
-        print_section(f"Authenticated Scan → {args.target} @ {domain}\\{args.username.split('/')[-1]}")
-
-        findings = run_authenticated_scan(args.target, args.username, pw, lmh, nth, domain, args.hash_format, outdir, args.rc4_only, args.no_roast, args.jitter, args.spider_shares)
-        auth_creds = {'username': args.username, 'password': pw, 'lmhash': lmh, 'nthash': nth}
-        print_suggestions(args.target, findings, auth_creds)
+        if args.spider_shares:
+            print_section(f"SMB Spider Module (Auth) → {args.target}")
+            if not domain:
+                domain = get_domain_from_ldap(args.target, args.username, pw, lmh, nth) or 'WORKGROUP'
+            enumerate_smb_shares_auth(args.target, domain, user, pw, lmh, nth, True, spider_log)
+        else:
+            print_section(f"Authenticated Scan → {args.target} @ {domain}\\{user}")
+            findings = run_authenticated_scan(args.target, args.username, pw, lmh, nth, domain, args.hash_format, outdir, args.rc4_only, args.no_roast, args.jitter, False)
+            auth_creds = {'username': args.username, 'password': pw, 'lmhash': lmh, 'nthash': nth}
+            print_suggestions(args.target, findings, auth_creds)
+    elif args.spider_shares:
+        print_section(f"SMB Spider Module (Anon) → {args.target}")
+        findings['sensitive_files_found'] = check_smb_null_session(args.target, True, spider_log)
+        print_suggestions(args.target, findings)
     else:
         print_section(f"Anonymous Scan → {args.target}")
         findings = run_anonymous_scan(args.target, args.users_file, args.hash_format, outdir, args.no_roast, args.jitter, args.spider_shares)
@@ -1419,6 +1458,9 @@ Examples:
     print_section("Scan finished")
     if outdir:
         print(f"Output logged to {outdir}")
+
+    if spider_log:
+        spider_log.close()
 
 if __name__ == "__main__":
     main()
