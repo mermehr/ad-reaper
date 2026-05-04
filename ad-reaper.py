@@ -30,10 +30,8 @@ import tempfile
 import subprocess
 from binascii import hexlify, unhexlify
 from pathlib import Path
-
 from pyasn1.codec.der import decoder, encoder
 from pyasn1.type.univ import noValue
-
 from impacket.dcerpc.v5 import samr, transport, dcomrt
 from impacket.dcerpc.v5.dcom import wmi
 from impacket.dcerpc.v5.ndr import NULL
@@ -47,7 +45,6 @@ from impacket.nmb import NetBIOSError
 from impacket.smb3 import FILE_ATTRIBUTE_DIRECTORY
 from impacket.smbconnection import SMBConnection, SessionError
 from impacket.nt_errors import STATUS_LOGON_FAILURE, STATUS_ACCESS_DENIED, STATUS_USER_SESSION_DELETED
-
 from ldap3 import Server, Connection, ANONYMOUS, NTLM, SUBTREE, BASE, ALL
 from ldap3.core.exceptions import LDAPInvalidCredentialsResult, LDAPSocketOpenError
 
