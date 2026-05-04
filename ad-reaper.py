@@ -69,6 +69,19 @@ def print_section(title):
     print(f" {title.upper()} ".center(70, "="))
     print("="*70 + "\n")
 
+def print_banner():
+    banner = rf"""
+{Style.CYAN}    ___    ____     ____                                 
+   /   |  / __ \   / __ \ ___  ____ _ ____  ___   _____ 
+  / /| | / / / /  / /_/ // _ \/ __ `// __ \/ _ \ / ___/ 
+ / ___ |/ /_/ /  / _, _//  __/ /_/ // /_/ /  __// /     
+/_/  |_/_____/  /_/ |_| \___/\__,_// .___/\___//_/      
+                                  /_/                   {Style.RESET}
+
+    Multi-protocol Active Directory Enumeration & Roasting Tool
+    """
+    print(banner)
+
 # ---- Openssl Patch ----
 
 def ensure_legacy_provider():
@@ -548,7 +561,7 @@ def query_ldap_anonymous(target_ip, output_dir=None):
         else:
             print_info("Querying for active, non-system user accounts...")
             real_users_filter = f'(&(objectClass=person)(!(objectClass=computer))(!(userAccountControl:1.2.840.113556.1.4.803:={UF_ACCOUNTDISABLE}))(!(sAMAccountName=HealthMailbox*)))'
-            conn.search(domain_dn, real_users_filter, SUBTREE, attributes=['sAMAccountName', 'description'])
+            conn.search(domain_dn, real_users_filter, SUBTREE, attributes=['sAMAccountName', 'description'], paged_size=1000)
 
             if conn.entries:
                 print_success("Found active users via LDAP:")
@@ -900,6 +913,37 @@ def enumerate_ldap_auth(target_ip, domain, username, password, lmhash, nthash, o
                 for target in entry['msDS-AllowedToDelegateTo']:
                     print(f"    - {target}")
 
+        print_info("Checking for Deleted Objects (Tombstoned)...")
+        try:
+            # LDAP_SERVER_SHOW_DELETED_OID = '1.2.840.113556.1.4.417'
+            del_base = f"CN=Deleted Objects,{search_base}"
+            conn.search(
+                del_base, 
+                '(isDeleted=TRUE)', 
+                attributes=['sAMAccountName', 'lastKnownParent', 'objectClass'], 
+                controls=[('1.2.840.113556.1.4.417', True, None)]
+            )
+            
+            res = conn.result
+            if res['result'] == 0:
+                if conn.entries:
+                    # Filter out the container itself
+                    deleted_items = [e for e in conn.entries if 'Deleted Objects' not in str(e.distinguishedName)]
+                    if deleted_items:
+                        print_success(f"  -> Found {len(deleted_items)} deleted objects!")
+                        for entry in deleted_items:
+                            u_name = entry.sAMAccountName.value if 'sAMAccountName' in entry else 'N/A'
+                            parent = entry.lastKnownParent.value if 'lastKnownParent' in entry else 'N/A'
+                            print(f"    - {Style.YELLOW}{u_name:<25}{Style.RESET} (Original Parent: {parent})")
+                else:
+                    print_info("  -> No deleted objects found.")
+            elif res['result'] == 50:
+                print_error("  -> Not authorized to query the Deleted Objects container.")
+            elif res['result'] == 32:
+                print_info("  -> Deleted Objects container not found (Recycle Bin likely disabled).")
+        except Exception as e:
+            print_error(f"  -> Error querying deleted objects: {e}")
+
         raw_file = Path(output_dir) / "ldap_users_raw.txt" if output_dir else None
         existing_users = set()
         if raw_file and raw_file.exists():
@@ -914,7 +958,7 @@ def enumerate_ldap_auth(target_ip, domain, username, password, lmhash, nthash, o
 
         print_info("Querying for active, non-system user accounts...")
         real_users_filter = f'(& (objectClass=person) (!(objectClass=computer)) (!(userAccountControl:1.2.840.113556.1.4.803:={UF_ACCOUNTDISABLE})) (!(sAMAccountName=HealthMailbox*)))'
-        conn.search(search_base, real_users_filter, search_scope=SUBTREE, attributes=['sAMAccountName', 'description'], size_limit=0)
+        conn.search(search_base, real_users_filter, search_scope=SUBTREE, attributes=['sAMAccountName', 'description'], paged_size=1000)
         
         if conn.entries:
             new_users_found = False
@@ -948,7 +992,7 @@ def enumerate_ldap_auth(target_ip, domain, username, password, lmhash, nthash, o
 
         print_info("Querying for high-value Server objects...")
         server_filter = '(&(objectClass=computer)(operatingSystem=*Server*))'
-        conn.search(search_base, server_filter, search_scope=SUBTREE, attributes=['sAMAccountName', 'operatingSystem', 'dNSHostName'], size_limit=0)
+        conn.search(search_base, server_filter, search_scope=SUBTREE, attributes=['sAMAccountName', 'operatingSystem', 'dNSHostName'], paged_size=500)
         if conn.entries:
             print_success("  Found Server Objects:")
             for entry in conn.entries:
@@ -961,7 +1005,7 @@ def enumerate_ldap_auth(target_ip, domain, username, password, lmhash, nthash, o
 
         print_info("Scanning for Service Principal Names (SPNs)...")
         spn_filter = '(&(objectClass=user)(servicePrincipalName=*)(!(sAMAccountName=krbtgt)))'
-        conn.search(search_base, spn_filter, attributes=['sAMAccountName', 'servicePrincipalName'])
+        conn.search(search_base, spn_filter, attributes=['sAMAccountName', 'servicePrincipalName'], paged_size=500)
         if conn.entries:
             print_success("  Found user accounts with SPNs (Potential Kerberoast Targets):")
             spn_users = []  # Collect users for roasting
@@ -980,7 +1024,7 @@ def enumerate_ldap_auth(target_ip, domain, username, password, lmhash, nthash, o
             print_secure("  No user accounts with SPNs found.")
 
         print_info("Querying for privileged accounts (adminCount=1)...")
-        conn.search(search_base, '(&(objectClass=user)(adminCount=1))', attributes=['sAMAccountName'])
+        conn.search(search_base, '(&(objectClass=user)(adminCount=1))', attributes=['sAMAccountName'], paged_size=500)
         if conn.entries:
             print_success("  -> Found accounts with adminCount=1 (High-Value Targets):")
             for entry in conn.entries:
@@ -1349,8 +1393,9 @@ def get_domain_from_ldap(target_ip, username=None, password=None, lmhash=None, n
 # ---- Main ----
 
 def main():
+    print_banner()
     parser = argparse.ArgumentParser(
-        description="AD-Reaper v2 - upgraded for CPTS / OSCP",
+        description="Multi-protocol Active Directory Enumeration & Roasting Tool",
         formatter_class=argparse.RawTextHelpFormatter,
         epilog="""
 Examples:
@@ -1358,7 +1403,7 @@ Examples:
     python ad-reaper.py 10.10.10.10
 
   Auth + targeted roasting:
-    python ad-reaper.py 10.10.10.10 -u corp.local/jdavis -p Winter2025 --users-file interesting_users.txt --rc4-only
+    python ad-reaper.py 10.10.10.10 -u corp.local/user -p Spring2026 --users-file interesting_users.txt --rc4-only
 
   PTH + output dir:
     python ad-reaper.py 10.10.10.10 -u Administrator -H aad3b...:31d6... --output loot
@@ -1368,7 +1413,7 @@ Examples:
     parser.add_argument("target", help="DC IP")
 
     g = parser.add_argument_group("Authentication")
-    g.add_argument("-u", "--username",   help="domain\\user or user@domain")
+    g.add_argument("-u", "--username",   help="corp.local/user or user@domain")
     g.add_argument("-p", "--password",   help="password")
     g.add_argument("-H", "--hashes",     help="LM:NT hash")
     g.add_argument("-d", "--domain",     help="Force domain name (useful when discovery fails)")
@@ -1416,7 +1461,6 @@ Examples:
             def close(self):
                 self.file.close()
         sys.stdout = Tee(log_file, 'w')
-
 
     findings = {}
     spider_log = None
