@@ -78,7 +78,7 @@ def print_banner():
 /_/  |_/_____/  /_/ |_| \___/\__,_// .___/\___//_/      
                                   /_/                   {Style.RESET}
 
-    Multi-protocol Active Directory Enumeration & Roasting Tool
+    Multi-protocol Active Directory Enumeration Tool
     """
     print(banner)
 
@@ -561,7 +561,7 @@ def query_ldap_anonymous(target_ip, output_dir=None):
         else:
             print_info("Querying for active, non-system user accounts...")
             real_users_filter = f'(&(objectClass=person)(!(objectClass=computer))(!(userAccountControl:1.2.840.113556.1.4.803:={UF_ACCOUNTDISABLE}))(!(sAMAccountName=HealthMailbox*)))'
-            conn.search(domain_dn, real_users_filter, SUBTREE, attributes=['sAMAccountName', 'description'], paged_size=1000)
+            conn.search(domain_dn, real_users_filter, SUBTREE, attributes=['sAMAccountName', 'description'])
 
             if conn.entries:
                 print_success("Found active users via LDAP:")
@@ -802,6 +802,7 @@ def enumerate_smb_shares_auth(target_ip, domain, username, password, lmhash, nth
         if spider_log: spider_log.write(strip_ansi(msg) + '\n')
 
     log_and_print(f"\n{'='*70}\n Authenticated SMB Share Enumeration \n{'='*70}")
+    conn = None
     try:
         conn = SMBConnection(target_ip, target_ip, timeout=5)
         conn.login(username, password, domain, lmhash=lmhash, nthash=nthash)
@@ -851,7 +852,6 @@ def enumerate_smb_shares_auth(target_ip, domain, username, password, lmhash, nth
                 log_and_print(f"\n    --- Scanning Share: {Style.CYAN}{share_name}{Style.RESET} ---")
                 spider_smb_share(conn, share_name, spider_log=spider_log)
 
-        conn.logoff()
     except SessionError as e:
         if e.getErrorCode() == STATUS_LOGON_FAILURE:
             log_and_print(f"SMB Login Failed: Invalid Credentials for {username}", "fail")
@@ -859,6 +859,12 @@ def enumerate_smb_shares_auth(target_ip, domain, username, password, lmhash, nth
             log_and_print(f"SMB Error: {e}", "fail")
     except Exception as e:
         log_and_print(f"Connection Error: {e}", "fail")
+    finally:
+        if conn:
+            try:
+                conn.logoff()
+            except:
+                pass
 
 def enumerate_ldap_auth(target_ip, domain, username, password, lmhash, nthash, output_dir=None):
     """
@@ -920,6 +926,7 @@ def enumerate_ldap_auth(target_ip, domain, username, password, lmhash, nthash, o
             conn.search(
                 del_base, 
                 '(isDeleted=TRUE)', 
+                search_scope=SUBTREE,
                 attributes=['sAMAccountName', 'lastKnownParent', 'objectClass'], 
                 controls=[('1.2.840.113556.1.4.417', True, None)]
             )
@@ -927,14 +934,18 @@ def enumerate_ldap_auth(target_ip, domain, username, password, lmhash, nthash, o
             res = conn.result
             if res['result'] == 0:
                 if conn.entries:
-                    # Filter out the container itself
-                    deleted_items = [e for e in conn.entries if 'Deleted Objects' not in str(e.distinguishedName)]
+                    # Exclude only the base container DN to get the actual deleted items
+                    deleted_items = [e for e in conn.entries if e.entry_dn.lower() != del_base.lower()]
                     if deleted_items:
                         print_success(f"  -> Found {len(deleted_items)} deleted objects!")
                         for entry in deleted_items:
-                            u_name = entry.sAMAccountName.value if 'sAMAccountName' in entry else 'N/A'
-                            parent = entry.lastKnownParent.value if 'lastKnownParent' in entry else 'N/A'
-                            print(f"    - {Style.YELLOW}{u_name:<25}{Style.RESET} (Original Parent: {parent})")
+                            u_name = entry.sAMAccountName.value if 'sAMAccountName' in entry and entry.sAMAccountName.value else None
+                            if not u_name:
+                                u_name = entry.entry_dn.split(',')[0].replace('CN=', '').split('\x00')[0]
+
+                            o_type = entry.objectClass.value[-1] if 'objectClass' in entry else 'Object'
+                            parent = entry.lastKnownParent.value if 'lastKnownParent' in entry and entry.lastKnownParent.value else 'N/A'
+                            print(f"    - {Style.YELLOW}{str(u_name):<25}{Style.RESET} ({o_type}) (Original Parent: {parent})")
                 else:
                     print_info("  -> No deleted objects found.")
             elif res['result'] == 50:
@@ -958,7 +969,7 @@ def enumerate_ldap_auth(target_ip, domain, username, password, lmhash, nthash, o
 
         print_info("Querying for active, non-system user accounts...")
         real_users_filter = f'(& (objectClass=person) (!(objectClass=computer)) (!(userAccountControl:1.2.840.113556.1.4.803:={UF_ACCOUNTDISABLE})) (!(sAMAccountName=HealthMailbox*)))'
-        conn.search(search_base, real_users_filter, search_scope=SUBTREE, attributes=['sAMAccountName', 'description'], paged_size=1000)
+        conn.search(search_base, real_users_filter, search_scope=SUBTREE, attributes=['sAMAccountName', 'description'], size_limit=0)
         
         if conn.entries:
             new_users_found = False
@@ -992,7 +1003,7 @@ def enumerate_ldap_auth(target_ip, domain, username, password, lmhash, nthash, o
 
         print_info("Querying for high-value Server objects...")
         server_filter = '(&(objectClass=computer)(operatingSystem=*Server*))'
-        conn.search(search_base, server_filter, search_scope=SUBTREE, attributes=['sAMAccountName', 'operatingSystem', 'dNSHostName'], paged_size=500)
+        conn.search(search_base, server_filter, search_scope=SUBTREE, attributes=['sAMAccountName', 'operatingSystem', 'dNSHostName'])
         if conn.entries:
             print_success("  Found Server Objects:")
             for entry in conn.entries:
@@ -1005,7 +1016,7 @@ def enumerate_ldap_auth(target_ip, domain, username, password, lmhash, nthash, o
 
         print_info("Scanning for Service Principal Names (SPNs)...")
         spn_filter = '(&(objectClass=user)(servicePrincipalName=*)(!(sAMAccountName=krbtgt)))'
-        conn.search(search_base, spn_filter, attributes=['sAMAccountName', 'servicePrincipalName'], paged_size=500)
+        conn.search(search_base, spn_filter, attributes=['sAMAccountName', 'servicePrincipalName'])
         if conn.entries:
             print_success("  Found user accounts with SPNs (Potential Kerberoast Targets):")
             spn_users = []  # Collect users for roasting
@@ -1024,7 +1035,7 @@ def enumerate_ldap_auth(target_ip, domain, username, password, lmhash, nthash, o
             print_secure("  No user accounts with SPNs found.")
 
         print_info("Querying for privileged accounts (adminCount=1)...")
-        conn.search(search_base, '(&(objectClass=user)(adminCount=1))', attributes=['sAMAccountName'], paged_size=500)
+        conn.search(search_base, '(&(objectClass=user)(adminCount=1))', attributes=['sAMAccountName'])
         if conn.entries:
             print_success("  -> Found accounts with adminCount=1 (High-Value Targets):")
             for entry in conn.entries:
@@ -1120,6 +1131,7 @@ def check_access_paths_auth(target_ip, user_groups, username, password, lmhash, 
     # WMI Access Check
     if check_port(target_ip, 135):
         print_info("  -> Port 135 is open, attempting WMI authentication...")
+        dcom = None
         try:
             dcom = dcomrt.DCOMConnection(target_ip, username, password, domain, lmhash, nthash, oxidResolver=True)
             iInterface = dcom.CoCreateInstanceEx(wmi.CLSID_WbemLevel1Login, wmi.IID_IWbemLevel1Login)
@@ -1127,12 +1139,18 @@ def check_access_paths_auth(target_ip, user_groups, username, password, lmhash, 
             iWbemLevel1Login.NTLMLogin('//./root/cimv2', NULL, NULL)
             print_success("  -> WMI Access is CONFIRMED (wmiexec.py should work)")
             iWbemLevel1Login.RemRelease()
-            dcom.disconnect()
         except Exception as e:
             if "rpc_s_access_denied" in str(e).lower() or "access denied" in str(e).lower():
                 print_error("  -> WMI Access DENIED (Creds rejected)")
             else:
                 print_error(f"  -> WMI Auth check failed: {e}")
+        finally:
+            if dcom:
+                try:
+                    # DCOM disconnect is crucial to stop background threads
+                    dcom.disconnect()
+                except:
+                    pass
 
     # Group correlation
     flat_groups = [g.lower() for g in user_groups]
@@ -1392,6 +1410,26 @@ def get_domain_from_ldap(target_ip, username=None, password=None, lmhash=None, n
 
 # ---- Main ----
 
+class Tee(object):
+    """Helper class to duplicate stdout to a file."""
+    def __init__(self, name, mode, original_stdout):
+        self.file = open(name, mode)
+        self.stdout = original_stdout
+    def write(self, data):
+        if self.stdout:
+            try:
+                self.stdout.write(data)
+            except (AttributeError, ValueError): pass
+        if self.file and not self.file.closed:
+            self.file.write(data)
+            self.file.flush()
+    def flush(self):
+        self.stdout.flush()
+        if not self.file.closed:
+            self.file.flush()
+    def close(self):
+        self.file.close()
+
 def main():
     print_banner()
     parser = argparse.ArgumentParser(
@@ -1440,68 +1478,66 @@ Examples:
     is_auth = bool(args.username and (args.password or args.hashes))
     outdir = None
 
-    if not args.no_logging:
-        outdir = Path(args.output)
-        outdir.mkdir(parents=True, exist_ok=True)
-        
-        log_name = "reaper_auth.log" if is_auth else "reaper_anon.log"
-        log_file = outdir / log_name
-
-        class Tee(object):
-            def __init__(self, name, mode):
-                self.file = open(name, mode)
-                self.stdout = sys.stdout
-            def write(self, data):
-                self.stdout.write(data)
-                self.file.write(data)
-                self.file.flush()
-            def flush(self):
-                self.stdout.flush()
-                self.file.flush()
-            def close(self):
-                self.file.close()
-        sys.stdout = Tee(log_file, 'w')
-
-    findings = {}
+    original_stdout = sys.stdout
+    log_tee = None
     spider_log = None
-    if args.spider_shares and not args.no_logging:
-        spider_log = open(outdir / "smb_spider.txt", 'w')
 
-    if is_auth:
-        domain = args.domain or ''
-        pw   = args.password or ""
-        lmh, nth = ("","")
-        if args.hashes:
-            lmh, nth = parse_hashes(args.hashes)
-        
-        p_domain, user = parse_identity(args.username)
-        domain = domain or p_domain
+    try:
+        if not args.no_logging:
+            outdir = Path(args.output)
+            outdir.mkdir(parents=True, exist_ok=True)
+            
+            log_name = "reaper_auth.log" if is_auth else "reaper_anon.log"
+            log_file = outdir / log_name
+            log_tee = Tee(log_file, 'w', original_stdout)
+            sys.stdout = log_tee
 
-        if args.spider_shares:
-            print_section(f"SMB Spider Module (Auth) → {args.target}")
-            if not domain:
-                domain = get_domain_from_ldap(args.target, args.username, pw, lmh, nth) or 'WORKGROUP'
-            enumerate_smb_shares_auth(args.target, domain, user, pw, lmh, nth, True, spider_log)
+        findings = {}
+        if args.spider_shares and not args.no_logging:
+            spider_log = open(outdir / "smb_spider.txt", 'w')
+
+        if is_auth:
+            domain = args.domain or ''
+            pw   = args.password or ""
+            lmh, nth = ("","")
+            if args.hashes:
+                lmh, nth = parse_hashes(args.hashes)
+            
+            p_domain, user = parse_identity(args.username)
+            domain = domain or p_domain
+
+            if args.spider_shares:
+                print_section(f"SMB Spider Module (Auth) → {args.target}")
+                if not domain:
+                    domain = get_domain_from_ldap(args.target, args.username, pw, lmh, nth) or 'WORKGROUP'
+                enumerate_smb_shares_auth(args.target, domain, user, pw, lmh, nth, True, spider_log)
+            else:
+                print_section(f"Authenticated Scan → {args.target} @ {domain}\\{user}")
+                findings = run_authenticated_scan(args.target, args.username, pw, lmh, nth, domain, args.hash_format, outdir, args.rc4_only, args.no_roast, args.jitter, False)
+                auth_creds = {'username': args.username, 'password': pw, 'lmhash': lmh, 'nthash': nth}
+                print_suggestions(args.target, findings, auth_creds)
+        elif args.spider_shares:
+            print_section(f"SMB Spider Module (Anon) → {args.target}")
+            findings['sensitive_files_found'] = check_smb_null_session(args.target, True, spider_log)
+            print_suggestions(args.target, findings)
         else:
-            print_section(f"Authenticated Scan → {args.target} @ {domain}\\{user}")
-            findings = run_authenticated_scan(args.target, args.username, pw, lmh, nth, domain, args.hash_format, outdir, args.rc4_only, args.no_roast, args.jitter, False)
-            auth_creds = {'username': args.username, 'password': pw, 'lmhash': lmh, 'nthash': nth}
-            print_suggestions(args.target, findings, auth_creds)
-    elif args.spider_shares:
-        print_section(f"SMB Spider Module (Anon) → {args.target}")
-        findings['sensitive_files_found'] = check_smb_null_session(args.target, True, spider_log)
-        print_suggestions(args.target, findings)
-    else:
-        print_section(f"Anonymous Scan → {args.target}")
-        findings = run_anonymous_scan(args.target, args.users_file, args.hash_format, outdir, args.no_roast, args.jitter, args.spider_shares)
-        print_suggestions(args.target, findings)
+            print_section(f"Anonymous Scan → {args.target}")
+            findings = run_anonymous_scan(args.target, args.users_file, args.hash_format, outdir, args.no_roast, args.jitter, args.spider_shares)
+            print_suggestions(args.target, findings)
 
-    print_section("Scan finished")
-    if outdir:
-        print(f"Output logged to {outdir}")
+        print_section("Scan finished")
+        if outdir:
+            print(f"Output logged to {outdir}")
 
-    if spider_log:
-        spider_log.close()
+    finally:
+        if log_tee:
+            sys.stdout = original_stdout
+            log_tee.close()
+        if spider_log:
+            spider_log.close()
+    
+    # Force exit to prevent hangs in background threads (DCOM/RPC)
+    os._exit(0)
 
 if __name__ == "__main__":
     main()
