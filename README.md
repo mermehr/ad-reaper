@@ -18,8 +18,8 @@ Designed to capture and report low hanging fruit fast, with very few dependencie
 - **Server Object Discovery:** Identifies high-value infrastructure (Domain Controllers, File Servers) via anonymous LDAP queries.
 - **Other AD Checks:** Looks other common misconfigurations that may be exploitable (ACDS, LAPS, admincount, delegations, etc.).
 - **Post-Scan Analysis:** Provides actionable suggestions based on the findings (e.g., reminding you to check for GPP passwords or suggesting specific `secretsdump` targets).
-- **AS-REP Roasting:** Automatically tests the discovered user list for accounts that do not require Kerberos pre-authentication and dumps the hashes. (Anon mode)
-- **Kerberoasting:** Automatically identifies service accounts (SPNs) and requests TGS tickets for offline cracking. (Auth mode)
+- **AS-REP Roasting:** Tests the discovered user list for accounts that do not require Kerberos pre-authentication.. (Anon mode)
+- **Kerberoasting:** Identifies service accounts (SPNs).. (Auth mode)
 
 ## Installation
 
@@ -39,70 +39,37 @@ Designed to capture and report low hanging fruit fast, with very few dependencie
 ## Usage
 
 ```bash
-usage: ad-reaper.py [-h] [-u USERNAME] [-p PASSWORD] [-H HASHES] [-d DOMAIN]
-                    [--hash-format {john,hashcat}] [-o OUTPUT] [--no-logging]
-                    [--users-file USERS_FILE] [--rc4-only] [--no-roast]
-                    [--jitter JITTER] [--spider-shares]
+usage: ad-reaper.py [-h] [-u USERNAME] [-p PASSWORD] [-H HASHES] [-d DOMAIN] [-o OUTPUT]
+                    [--spider-shares]
                     target
 
-Active Directory Reaper: High-Speed Enumeration & Roasting
+Multi-protocol Active Directory Enumeration & Roasting Tool
 
 positional arguments:
-  target                Target IP or hostname (Domain Controller)
+  target                DC IP
 
 options:
   -h, --help            show this help message and exit
 
 Authentication:
-  -u USERNAME, --username USERNAME
-                        Username (format: [domain/]user)
-  -p PASSWORD, --password PASSWORD
-                        Password
-  -H HASHES, --hashes HASHES
-                        NTLM hashes (format: [LM:]NT)
-  -d DOMAIN, --domain DOMAIN
-                        Force domain name (useful when discovery fails)
+  -u, --username USERNAME
+                        corp.local/user or user@domain
+  -p, --password PASSWORD
+                        password
+  -H, --hashes HASHES   LM:NT hash
+  -d, --domain DOMAIN   Force domain name (useful when discovery fails)
 
 Roasting & Output:
-  --hash-format {john,hashcat}
   -o, --output OUTPUT   Output dir for logs and hashes (default: reaper-logs)
-  --no-logging          Disable file logging (logs and hashes)
-  --users-file USERS_FILE
-                        Target only these users for AS-REP roasting
-  --rc4-only            Force RC4 for Kerberoasting
-  --no-roast            Report roastable users without requesting tickets
-  --jitter JITTER       Delay (seconds) jitter for roasting requests (evasion)
   --spider-shares       Recursively list files on accessible SMB shares
 
 Examples:
   Anonymous scan:
     python ad-reaper.py 10.10.10.10
 
-  Auth + targeted roasting:
-    python ad-reaper.py 10.10.10.10 -u corp.local/jdavis -p Winter2025 --users-file interesting_users.txt --rc4-only
+  Authenticated scan:
+    python ad-reaper.py 10.10.10.10 -u corp.local/user -p Spring2026
 
   PTH + output dir:
     python ad-reaper.py 10.10.10.10 -u Administrator -H aad3b...:31d6... --output loot
 ```
-
-## OpSec
-
-**This tool is loud.**
-
-- It touches the disk (SMB write checks).
-- It generates significant LDAP and RPC traffic.
-- It attempts Kerberos authentication against many users.
-
-**Do not** run this if your goal is evasion. It is designed for efficiency and speed during assessments where "getting caught" by an EDR/SIEM is expected or part of the test.
-
----
-
-## Preview
-
-**Anonymous:**
-
-![anon](assets/anon.gif)
-
-**Authenticated:**
-
-![auth](assets/auth.gif)
