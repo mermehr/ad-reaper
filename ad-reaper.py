@@ -143,8 +143,8 @@ def dn_to_dns(dn):
     return '.'.join(parts).lower() if parts else None
 
 def parse_identity(s):
-    if '/' in s: return s.split('/', 1)
-    if '\\' in s: return s.split('\\', 1)
+    if '/' in s: return s.split('/', 1)  # noqa: E701
+    if '\\' in s: return s.split('\\', 1)  # noqa: E701
     return '', s
 
 def parse_hashes(h):
@@ -152,7 +152,7 @@ def parse_hashes(h):
         lm, nt = h.split(':')
         if len(lm) == 32 and len(nt) == 32:
             return lm, nt
-    except:
+    except:  # noqa: E722
         pass
     print_error("Invalid hash format. Expected LM:NT")
     sys.exit(1)
@@ -170,9 +170,9 @@ def spider_smb_share(conn, share, path='\\', max_depth=5, current_depth=0, spide
     SENSITIVE_EXTS = ('.xml', '.txt', '.ini', '.config', '.kdbx', '.toml', '.cfg', '.pdf')
 
     def log_and_print(msg, level="info"):
-        if level == "vuln": print_vuln(msg)
-        else: print(msg)
-        if spider_log: spider_log.write(strip_ansi(msg) + '\n')
+        if level == "vuln": print_vuln(msg)  # noqa: E701
+        else: print(msg)  # noqa: E701
+        if spider_log: spider_log.write(strip_ansi(msg) + '\n')  # noqa: E701
 
     if current_depth > max_depth:
         return False
@@ -181,7 +181,7 @@ def spider_smb_share(conn, share, path='\\', max_depth=5, current_depth=0, spide
         files = conn.listPath(share, path + "*")
         for f in files:
             filename = f.get_longname()
-            if filename in ('.', '..'): continue
+            if filename in ('.', '..'): continue  # noqa: E701
 
             is_dir = f.get_attributes() & FILE_ATTRIBUTE_DIRECTORY
             full_path = f"{path}{filename}"
@@ -196,7 +196,7 @@ def spider_smb_share(conn, share, path='\\', max_depth=5, current_depth=0, spide
                     found_sensitive = True
                 else:
                     log_and_print(f"      > {full_path}")
-    except:
+    except:  # noqa: E722
         pass
     return found_sensitive
 
@@ -209,10 +209,10 @@ def check_smb_null_session(target_ip, spider_shares=False, spider_log=None):
     SHARES_TO_SKIP = ('IPC$', 'PRINT$')
 
     def log_and_print(msg, type="info"):
-        if type == "success": print_success(msg)
-        elif type == "info": print_info(msg)
-        elif type == "error": print_error(msg)
-        if spider_log: spider_log.write(strip_ansi(msg) + '\n')
+        if type == "success": print_success(msg)  # noqa: E701
+        elif type == "info": print_info(msg)  # noqa: E701
+        elif type == "error": print_error(msg)  # noqa: E701
+        if spider_log: spider_log.write(strip_ansi(msg) + '\n')  # noqa: E701
 
     log_and_print("Checking for anonymous SMB login and share listing (port 445)...")
     for user in ['', '.', 'anonymous', 'guest']:  # Null session users
@@ -383,8 +383,8 @@ def query_ldap_anonymous(target_ip, output_dir=None):
                             vuln_flag = f"{Style.RED}[AS-REP]{Style.RESET}"
                             asrep_list.append(username)
                         print(f"{Style.YELLOW}{username:<25}{Style.RESET} {vuln_flag}")
-                        if f_raw: f_raw.write(f"{username} | {entry.description.value or ''}\n")
-                if f_raw: f_raw.close()
+                        if f_raw: f_raw.write(f"{username} | {entry.description.value or ''}\n")  # noqa: E701
+                if f_raw: f_raw.close()  # noqa: E701
 
         print_info("Querying for users with Service Principal Names (SPNs)...")
         spn_filter = '(&(objectClass=user)(servicePrincipalName=*)(!(sAMAccountName=krbtgt)))'
@@ -455,7 +455,7 @@ def enumerate_users_samr(target_ip, output_dir=None, domain=None):
     all_found_users = []
 
     for user in ['', '.']:
-        if all_found_users: break
+        if all_found_users: break  # noqa: E701
         try:
             string_binding = r'ncacn_np:%s[\pipe\samr]' % target_ip
             rpc_transport = transport.DCERPCTransportFactory(string_binding)
@@ -553,12 +553,12 @@ def get_domain_from_ldap(target_ip):
 def enumerate_smb_shares_auth(target_ip, domain, username, password, lmhash, nthash, spider_shares=False, spider_log=None):
     """Connects to SMB with credentials and lists accessible shares."""
     def log_and_print(msg, type="info"):
-        if type == "success": print_success(msg)
-        elif type == "info": print_info(msg)
-        elif type == "fail": print_fail(msg)
-        if spider_log: spider_log.write(strip_ansi(msg) + '\n')
+        if type == "success": print_success(msg)  # noqa: E701
+        elif type == "info": print_info(msg)  # noqa: E701
+        elif type == "fail": print_fail(msg)  # noqa: E701
+        if spider_log: spider_log.write(strip_ansi(msg) + '\n')  # noqa: E701
 
-    log_and_print(f"\n{'='*70}\n Authenticated SMB Share Enumeration \n{'='*70}")
+    print_section("Authenticated SMB Share Enumeration")
     conn = None
     try:
         conn = SMBConnection(target_ip, target_ip, timeout=5)
@@ -620,7 +620,7 @@ def enumerate_smb_shares_auth(target_ip, domain, username, password, lmhash, nth
         if conn:
             try:
                 conn.logoff()
-            except:
+            except:  # noqa: E722
                 pass
 
 def enumerate_ldap_auth(target_ip, domain, username, password, lmhash, nthash, output_dir=None):
@@ -754,9 +754,9 @@ def enumerate_ldap_auth(target_ip, domain, username, password, lmhash, nthash, o
                         print(f"{Style.YELLOW}{u_name:<25}{Style.RESET} {desc}")
                         user_list.append(u_name)
                         existing_users.add(u_name)
-                        if f_raw: f_raw.write(f"{u_name} | {desc}\n")
+                        if f_raw: f_raw.write(f"{u_name} | {desc}\n")  # noqa: E701
             
-            if f_raw: f_raw.close()
+            if f_raw: f_raw.close()  # noqa: E701
             
             if not new_users_found:
                 if existing_users:
@@ -851,6 +851,7 @@ def find_ad_misconfigs_auth(target_ip, domain, username, password, lmhash, nthas
         server = Server(target_ip, get_info=ALL)
         conn = Connection(server, user=user_dn, password=password if password else None, authentication=NTLM, auto_bind=True)
 
+        # Unconstrained Delegation Check
         print_info("Checking for accounts with Unconstrained Delegation...")
         delegation_filter = '(userAccountControl:1.2.840.113556.1.4.803:=524288)'
         conn.search(search_base, delegation_filter, attributes=['sAMAccountName', 'objectClass'], paged_size=500)  # Paged
@@ -861,9 +862,10 @@ def find_ad_misconfigs_auth(target_ip, domain, username, password, lmhash, nthas
                 obj_type = "User"
                 if 'computer' in [x.lower() for x in entry.objectClass.value]:
                     obj_type = "Computer"
-                print_success(f"  -> VULNERABLE: {entry.sAMAccountName.value} ({obj_type}) has Unconstrained Delegation!")
+                print_vuln(f"  -> VULNERABLE: {entry.sAMAccountName.value} ({obj_type}) has Unconstrained Delegation!")
                 findings['unconstrained_delegation'].append(entry.sAMAccountName.value)
 
+        # Constrained Delegation Check
         print_info("Checking for Users with Constrained Delegation (Outbound Control)...")
         # Filter for standard users (excluding computers) with constrained delegation configured
         constrained_filter = '(&(objectClass=user)(!(objectClass=computer))(msDS-AllowedToDelegateTo=*))'
@@ -878,20 +880,57 @@ def find_ad_misconfigs_auth(target_ip, domain, username, password, lmhash, nthas
         else:
             print_secure("  -> No standard users found with Constrained Delegation.")
 
+        # LAPS Check
         print_info("Checking for readable LAPS passwords...")
-        laps_attrs = ['sAMAccountName', 'ms-Mcs-AdmPwd', 'msLAPS-Password']
-        conn.search(search_base, '(objectClass=computer)', attributes=laps_attrs, paged_size=500)
         found_laps = False
-        for entry in conn.entries:
-            laps_pw = entry.get('ms-Mcs-AdmPwd') or entry.get('msLAPS-Password')
-            if laps_pw and laps_pw.value:
-                print_vuln(f"  -> VULNERABLE: Can read LAPS password for {entry.sAMAccountName.value}: {laps_pw.value}")
-                found_laps = True
-                findings['laps_readable'].append(entry.sAMAccountName.value)
+        # Legacy LAPS Check
+        try:
+            conn.search(
+                search_base,
+                '(ms-Mcs-AdmPwd=*)',  # presence filter
+                attributes=['sAMAccountName', 'ms-Mcs-AdmPwd'],
+                paged_size=500
+            )
+            for entry in conn.entries:
+                if 'ms-Mcs-AdmPwd' in entry:
+                    laps_pw = entry['ms-Mcs-AdmPwd']
+                    if laps_pw.value:
+                        print_vuln(f"  -> VULNERABLE: Can read LAPS password for {entry.sAMAccountName.value}: {laps_pw.value}")
+                        found_laps = True
+                        if entry.sAMAccountName.value not in findings['laps_readable']:
+                            findings['laps_readable'].append(entry.sAMAccountName.value)
+        except Exception as e:
+            err = str(e).lower()
+            if 'invalid attribute type' in err or 'no such attribute' in err or 'undefined attribute type' in err:
+                print_info("  -> Legacy LAPS attribute (ms-Mcs-AdmPwd) not present in schema — skipping")
+            else:
+                print_error(f"  -> Legacy LAPS check failed: {str(e).splitlines()[0]}")
+        # Modern LAPS Check
+        try:
+            conn.search(
+                search_base,
+                '(msLAPS-Password=*)',
+                attributes=['sAMAccountName', 'msLAPS-Password'],
+                paged_size=500
+            )
+            for entry in conn.entries:
+                laps_pw = entry.get('msLAPS-Password')
+                if laps_pw and laps_pw.value:
+                    print_vuln(f"  -> VULNERABLE: Can read LAPS password for {entry.sAMAccountName.value}: {laps_pw.value}")
+                    found_laps = True
+                    if entry.sAMAccountName.value not in findings['laps_readable']:
+                        findings['laps_readable'].append(entry.sAMAccountName.value)
+        except Exception as e:
+            err = str(e).lower()
+            if 'invalid attribute type' in err or 'no such attribute' in err or 'undefined attribute type' in err:
+                print_info("  -> Modern LAPS attributes (msLAPS-*) not present in schema (legacy environment) — skipping")
+            else:
+                print_error(f"  -> Modern LAPS check failed: {str(e).splitlines()[0]}")
+
         if not found_laps:
             print_secure("  -> No readable LAPS passwords found.")
         else:
-            print_info("Note: Checked both legacy 'ms-Mcs-AdmPwd' and modern 'msLAPS-Password'")
+            pass
 
         conn.unbind()
     except Exception as e:
@@ -931,7 +970,7 @@ def check_access_paths_auth(target_ip, user_groups, username, password, lmhash, 
                 try:
                     # DCOM disconnect is crucial to stop background threads
                     dcom.disconnect()
-                except:
+                except:  # noqa: E722
                     pass
 
     # Group correlation
@@ -1099,7 +1138,7 @@ def run_authenticated_scan(target_ip, username, password, lmhash, nthash, domain
     check_access_paths_auth(target_ip, user_groups, user, password, lmhash, nthash, domain)
     return findings
 
-def get_domain_from_ldap(target_ip, username=None, password=None, lmhash=None, nthash=None):
+def get_domain_from_ldap(target_ip, username=None, password=None, lmhash=None, nthash=None):  # noqa: F811
     """
     Discover domain FQDN via LDAP RootDSE query.
     Tries anonymous bind first; if that fails and creds are provided, uses authenticated bind.
@@ -1169,7 +1208,7 @@ class Tee(object):
         if self.stdout:
             try:
                 self.stdout.write(data)
-            except (AttributeError, ValueError): pass
+            except (AttributeError, ValueError): pass  # noqa: E701
         if self.file and not self.file.closed:
             self.file.write(data)
             self.file.flush()
@@ -1191,7 +1230,8 @@ Examples:
     python ad-reaper.py 10.10.10.10
 
   Authenticated scan:
-    python ad-reaper.py 10.10.10.10 -u corp.local/user -p Spring2026
+    python ad-reaper.py 10.10.10.10 -u tommy -p Spring2026
+    python ad-reaper.py 10.10.10.10 -d example.local -u tommy -p Spring2026
 
   PTH + output dir:
     python ad-reaper.py 10.10.10.10 -u Administrator -H aad3b...:31d6... --output loot
@@ -1201,12 +1241,12 @@ Examples:
     parser.add_argument("target", help="DC IP")
 
     g = parser.add_argument_group("Authentication")
-    g.add_argument("-u", "--username",   help="corp.local/user or user@domain")
-    g.add_argument("-p", "--password",   help="password")
+    g.add_argument("-u", "--username")
+    g.add_argument("-p", "--password")
     g.add_argument("-H", "--hashes",     help="LM:NT hash")
     g.add_argument("-d", "--domain",     help="Force domain name (useful when discovery fails)")
 
-    g = parser.add_argument_group("Roasting & Output")
+    g = parser.add_argument_group("Output & Modules")
     g.add_argument("-o", "--output",     default="reaper-logs", help="Output dir for logs and hashes (default: reaper-logs)")
     g.add_argument("--spider-shares",    action="store_true", help="Recursively list files on accessible SMB shares")
 
@@ -1214,7 +1254,7 @@ Examples:
 
     try:
         ipaddress.ip_address(args.target)
-    except:
+    except:  # noqa: E722
         print_error(f"Invalid IP: {args.target}")
         sys.exit(1)
 
