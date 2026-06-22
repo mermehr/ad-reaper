@@ -19,7 +19,7 @@ Designed to capture and report low hanging fruit fast, with very few dependencie
 - **Other AD Checks:** Looks other common misconfigurations that may be exploitable (ACDS, LAPS, admincount, delegations, etc.).
 - **Post-Scan Analysis:** Provides actionable suggestions based on the findings (e.g., reminding you to check for GPP passwords or suggesting specific `secretsdump` targets).
 - **AS-REP Roasting:** Tests the discovered user list for accounts that do not require Kerberos pre-authentication.. (Anon mode)
-- **Kerberoasting:** Identifies service accounts (SPNs).. (Auth mode)
+- **Kerberoasting:** Identifies service accounts (SPNs).. (Auth mode) 
 
 ## Installation
 
