@@ -43,7 +43,7 @@ usage: ad-reaper.py [-h] [-u USERNAME] [-p PASSWORD] [-H HASHES] [-d DOMAIN] [-o
                     [--spider-shares]
                     target
 
-Multi-protocol Active Directory Enumeration & Roasting Tool
+Multi-protocol Active Directory Enumeration Tool
 
 positional arguments:
   target                DC IP
