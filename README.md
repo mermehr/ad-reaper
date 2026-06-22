@@ -53,13 +53,11 @@ options:
 
 Authentication:
   -u, --username USERNAME
-                        corp.local/user or user@domain
   -p, --password PASSWORD
-                        password
   -H, --hashes HASHES   LM:NT hash
   -d, --domain DOMAIN   Force domain name (useful when discovery fails)
 
-Roasting & Output:
+Output & Modules:
   -o, --output OUTPUT   Output dir for logs and hashes (default: reaper-logs)
   --spider-shares       Recursively list files on accessible SMB shares
 
@@ -68,7 +66,8 @@ Examples:
     python ad-reaper.py 10.10.10.10
 
   Authenticated scan:
-    python ad-reaper.py 10.10.10.10 -u corp.local/user -p Spring2026
+    python ad-reaper.py 10.10.10.10 -u tommy -p Spring2026
+    python ad-reaper.py 10.10.10.10 -d example.local -u tommy -p Spring2026
 
   PTH + output dir:
     python ad-reaper.py 10.10.10.10 -u Administrator -H aad3b...:31d6... --output loot
