@@ -11,7 +11,7 @@ Designed to capture and report low hanging fruit fast, with very few dependencie
 ## Modes & Features
 
 - **Null Session Hunting:** Automatically tries both `''` and `.` usernames to bypass weak null session filters on SMB and SAMR.
-- **Share Auditing:** Checks permissions across all discovered shares and attempts to identify writeable directories.
+- **Share Auditing:** Checks permissions across all discovered shares and attempts to identify writable directories.
 - **Recursive SMB Walking:** Walks directories to find sensitive files (e.g., `web.config`, `passwords.txt`) if the `--spider-shares` flag is used.
 - **Hybrid User Enumeration:** Generates a master user list by combining anonymous LDAP queries (active users) with RPC/SAMR enumeration (all users/RIDs).
 - **Group Policy & Object Auditing:** Identifies interesting group memberships, misconfiguration and deleted objects . (Auth mode)
@@ -72,3 +72,9 @@ Examples:
   PTH + output dir:
     python ad-reaper.py 10.10.10.10 -u Administrator -H aad3b...:31d6... --output loot
 ```
+
+## Screenshots
+
+Authenticated scan log:
+
+![auth_scan](./assets/auth_scan.png)
