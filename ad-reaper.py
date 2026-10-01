@@ -365,12 +365,13 @@ def query_ldap_anonymous(target_ip, output_dir=None):
 
             if conn.entries:
                 print_success("Found active users via LDAP:")
-                print(f"{Style.YELLOW}{'Username':<25} {'Vulnerability'}{Style.RESET}")
-                print(f"{'-'*25} {'-'*25}")
+                print(f"{Style.YELLOW}{'Username':<25} {'Vuln':<8} {'Description'} {Style.RESET}")
+                print(f"{'-'*25} {'-'*8} {'-'*25}")
                 
                 f_raw = open(raw_file, 'w') if raw_file else None
                 for entry in conn.entries:
                     username = entry.sAMAccountName.value
+                    description = entry.description.value or 'N/A'
                     try:
                         uac = int(entry.userAccountControl.value) if 'userAccountControl' in entry else 0
                     except (ValueError, TypeError):
@@ -382,8 +383,8 @@ def query_ldap_anonymous(target_ip, output_dir=None):
                         if uac & UF_DONT_REQUIRE_PREAUTH:
                             vuln_flag = f"{Style.RED}[AS-REP]{Style.RESET}"
                             asrep_list.append(username)
-                        print(f"{Style.YELLOW}{username:<25}{Style.RESET} {vuln_flag}")
-                        if f_raw: f_raw.write(f"{username} | {entry.description.value or ''}\n")  # noqa: E701
+                        print(f"{Style.YELLOW}{username:<25}{Style.RESET} {vuln_flag:<8} {description}")
+                        if f_raw: f_raw.write(f"{username} | {description}\n")  # noqa: E701
                 if f_raw: f_raw.close()  # noqa: E701
 
         print_info("Querying for users with Service Principal Names (SPNs)...")
@@ -1163,7 +1164,9 @@ def get_domain_from_ldap(target_ip, username=None, password=None, lmhash=None, n
                     user=user_dn,
                     password=password,
                     authentication=NTLM,
+                    # pyrefly: ignore [unexpected-keyword]
                     lm_hash=lmhash,
+                    # pyrefly: ignore [unexpected-keyword]
                     nt_hash=nthash,
                     auto_bind=True
                 )
