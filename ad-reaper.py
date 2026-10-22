@@ -16,6 +16,7 @@ Leverages credentials to perform a deep-dive enumeration. It checks for accessib
 remote access pathways, and common AD misconfigurations.
 """
 
+from typing import Any
 import sys
 import os
 import re
@@ -25,6 +26,7 @@ import socket
 import hashlib
 import tempfile
 import subprocess
+import ssl
 from pathlib import Path
 from impacket.dcerpc.v5 import samr, transport, dcomrt
 from impacket.dcerpc.v5.dcom import wmi
@@ -36,7 +38,7 @@ from impacket.nmb import NetBIOSError
 from impacket.smb3 import FILE_ATTRIBUTE_DIRECTORY
 from impacket.smbconnection import SMBConnection, SessionError
 from impacket.nt_errors import STATUS_LOGON_FAILURE, STATUS_ACCESS_DENIED, STATUS_USER_SESSION_DELETED
-from ldap3 import Server, Connection, ANONYMOUS, NTLM, SUBTREE, BASE, ALL
+from ldap3 import Server, Connection, Tls, ANONYMOUS, NTLM, SUBTREE, BASE, ALL, SASL
 from ldap3.core.exceptions import LDAPInvalidCredentialsResult, LDAPSocketOpenError
 
 # ---- Colors ----
@@ -624,6 +626,66 @@ def enumerate_smb_shares_auth(target_ip, domain, username, password, lmhash, nth
             except:  # noqa: E722
                 pass
 
+def create_ldap_conn(target_ip, user_dn, password, lmhash=None, nthash=None, prefer_ldaps=True):
+    """
+    Attempts to create an LDAP connection using the provided credentials.
+    Tries multiple methods (LDAPS, StartTLS, LDAP signing) in order of preference.
+    """
+    try:
+        from ldap3 import ENCRYPT, TLS_CHANNEL_BINDING
+    except ImportError:
+        ENCRYPT = None
+        TLS_CHANNEL_BINDING = None
+
+    if lmhash and nthash and (not password or ':' not in str(password)):
+        auth_pw = f"{lmhash}:{nthash}"
+    else:
+        auth_pw = password
+
+    if not auth_pw:
+        raise ValueError("No password or hash provided for NTLM bind")
+
+    attempts: list[Any] = []
+    if prefer_ldaps:
+        attempts.append(("ldaps", 636, True))
+    attempts.append(("ldap+starttls", 389, False))
+    attempts.append(("ldap+sign", 389, False))
+
+    last_err = None
+    for name, port, use_ssl in attempts:
+        try:
+            tls = Tls(validate=ssl.CERT_NONE) if use_ssl else None
+            server = Server(target_ip, port=port, use_ssl=use_ssl, tls=tls, get_info=ALL)
+
+            kwargs = {
+                "user": user_dn,
+                "password": auth_pw,
+                "authentication": NTLM,
+                "auto_bind": False,
+            }
+
+            # TLS and signing options
+            if name == "ldap+sign" and ENCRYPT is not None:
+                kwargs["session_security"] = ENCRYPT
+            if use_ssl and TLS_CHANNEL_BINDING is not None:
+                kwargs["channel_binding"] = TLS_CHANNEL_BINDING
+
+            conn = Connection(server, **kwargs)
+
+            if name == "ldap+starttls":
+                conn.open()
+                conn.start_tls()
+
+            if conn.bind():
+                print_success(f"LDAP bind OK via {name}")
+                return conn
+
+        except Exception as e:
+            last_err = e
+            # print_error(f"{name} failed: {e}")
+            
+    raise last_err or Exception("All LDAP bind methods failed")
+
 def enumerate_ldap_auth(target_ip, domain, username, password, lmhash, nthash, output_dir=None):
     """
     Performs a comprehensive, authenticated LDAP enumeration.
@@ -633,22 +695,36 @@ def enumerate_ldap_auth(target_ip, domain, username, password, lmhash, nthash, o
     findings = {'spns': [], 'admin_users': [], 'asrep_users': [], 'adcs_servers': []}
     print_section("Authenticated LDAP Enumeration")
     user_dn = f"{domain}\\{username}" if domain else username
+    auth_password = f"{lmhash}:{nthash}" if (lmhash and nthash) else password
     user_groups = []
     user_list = []
     search_base = None
 
     try:
         server = Server(target_ip, get_info=ALL)
-        auth_password = f"{lmhash}:{nthash}" if lmhash and nthash else password
-        conn = Connection(server, user=user_dn, password=auth_password, authentication=NTLM, auto_bind=True)
+        conn = create_ldap_conn(
+            target_ip,
+            user_dn,
+            auth_password,          # or just password if you're not using hashes
+            lmhash=lmhash or None,
+            nthash=nthash or None,
+            prefer_ldaps=True
+        )
         print_success(f"LDAP Bind Successful as {user_dn}")
 
-        if server.info and server.info.other.get('defaultNamingContext'):
-            search_base = server.info.other['defaultNamingContext'][0]
+        # Prefer the bound connection's info
+        if conn.server.info and conn.server.info.other.get('defaultNamingContext'):
+            search_base = conn.server.info.other['defaultNamingContext'][0]
             print_info(f"Target Domain: {search_base}")
         else:
-            print_fail("Could not determine DefaultNamingContext.")
-            return None, [], findings, []
+            # Fallback: explicit RootDSE query
+            conn.search('', '(objectClass=*)', BASE, attributes=['defaultNamingContext'])
+            if conn.entries and 'defaultNamingContext' in conn.entries[0]:
+                search_base = conn.entries[0].defaultNamingContext.value
+                print_info(f"Target Domain: {search_base}")
+            else:
+                print_fail("Could not determine DefaultNamingContext.")
+                return None, [], findings, []
 
         print_info(f"Querying groups for user '{username}'...")
         conn.search(search_base, f'(sAMAccountName={username})', attributes=['memberOf', 'primaryGroupID', 'msDS-AllowedToDelegateTo'])
@@ -848,9 +924,33 @@ def find_ad_misconfigs_auth(target_ip, domain, username, password, lmhash, nthas
     findings = {'unconstrained_delegation': [], 'constrained_delegation': [], 'laps_readable': []}
     print_section("AD Misconfiguration Check")
     user_dn = f"{domain}\\{username}" if domain else username
+    auth_password = f"{lmhash}:{nthash}" if (lmhash and nthash) else password
+
     try:
         server = Server(target_ip, get_info=ALL)
-        conn = Connection(server, user=user_dn, password=password if password else None, authentication=NTLM, auto_bind=True)
+        conn = create_ldap_conn(
+            target_ip,
+            user_dn,
+            auth_password,
+            lmhash=lmhash or None,
+            nthash=nthash or None,
+            prefer_ldaps=True
+        )
+        print_success(f"LDAP Bind Successful as {user_dn}")
+
+        # Prefer the bound connection's info
+        if conn.server.info and conn.server.info.other.get('defaultNamingContext'):
+            search_base = conn.server.info.other['defaultNamingContext'][0]
+            print_info(f"Target Domain: {search_base}")
+        else:
+            # Fallback: explicit RootDSE query
+            conn.search('', '(objectClass=*)', BASE, attributes=['defaultNamingContext'])
+            if conn.entries and 'defaultNamingContext' in conn.entries[0]:
+                search_base = conn.entries[0].defaultNamingContext.value
+                print_info(f"Target Domain: {search_base}")
+            else:
+                print_fail("Could not determine DefaultNamingContext.")
+                return None, [], findings, []
 
         # Unconstrained Delegation Check
         print_info("Checking for accounts with Unconstrained Delegation...")
@@ -1130,7 +1230,7 @@ def run_authenticated_scan(target_ip, username, password, lmhash, nthash, domain
 
     findings.update(ldap_findings)
     if search_base:
-        misconfig_findings = find_ad_misconfigs_auth(target_ip, domain, username, password, lmhash, nthash, search_base)
+        misconfig_findings = find_ad_misconfigs_auth(target_ip, domain, user, password, lmhash, nthash, search_base)
         findings.update(misconfig_findings)
         findings['domain_name'] = dn_to_dns(search_base)
 
@@ -1158,19 +1258,17 @@ def get_domain_from_ldap(target_ip, username=None, password=None, lmhash=None, n
         print_error(f"Anonymous bind failed: {anon_err} — trying authenticated if creds available...")
         if username and (password or (lmhash and nthash)):
             user_dn = f"{username}"  # Adjust if needed for DOMAIN\user
+            auth_password = f"{lmhash}:{nthash}" if lmhash and nthash else password
             try:
-                conn = Connection(
-                    server,
-                    user=user_dn,
-                    password=password,
-                    authentication=NTLM,
-                    # pyrefly: ignore [unexpected-keyword]
-                    lm_hash=lmhash,
-                    # pyrefly: ignore [unexpected-keyword]
-                    nt_hash=nthash,
-                    auto_bind=True
+                conn = create_ldap_conn(
+                    target_ip,
+                    user_dn,
+                    auth_password,
+                    lmhash=lmhash,
+                    nthash=nthash,
+                    prefer_ldaps=True
                 )
-                print_success("Authenticated bind worked for discovery")
+                print_success(f"LDAP Bind Successful as {user_dn}")
             except Exception as auth_err:
                 print_error(f"Authenticated bind failed: {auth_err}")
                 return None
