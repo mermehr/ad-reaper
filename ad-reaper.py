@@ -626,7 +626,7 @@ def enumerate_smb_shares_auth(target_ip, domain, username, password, lmhash, nth
             except:  # noqa: E722
                 pass
 
-def create_ldap_conn(target_ip, user_dn, password, lmhash=None, nthash=None, prefer_ldaps=True):
+def create_ldap_conn(target_ip, user_dn, password, lmhash=None, nthash=None, prefer_ldaps=False):
     """
     Attempts to create an LDAP connection using the provided credentials.
     Tries multiple methods (LDAPS, StartTLS, LDAP signing) in order of preference.
@@ -647,9 +647,17 @@ def create_ldap_conn(target_ip, user_dn, password, lmhash=None, nthash=None, pre
 
     attempts: list[Any] = []
     if prefer_ldaps:
+        # Try LDAPS first, then signed NTLM, then StartTLS
         attempts.append(("ldaps", 636, True))
-    attempts.append(("ldap+starttls", 389, False))
-    attempts.append(("ldap+sign", 389, False))
+        attempts.append(("ldap+sign", 389, False))
+        attempts.append(("ldap+starttls", 389, False))
+        print_info("Attempting LDAP bind with preference for LDAPS (port 636)...")
+    else:
+        # Default: signed NTLM first
+        attempts.append(("ldap+sign", 389, False))
+        attempts.append(("ldap+starttls", 389, False))
+        attempts.append(("ldaps", 636, True))
+        print_info("Attempting LDAP bind with preference for signed NTLM (port 389)...")
 
     last_err = None
     for name, port, use_ssl in attempts:
@@ -686,7 +694,7 @@ def create_ldap_conn(target_ip, user_dn, password, lmhash=None, nthash=None, pre
             
     raise last_err or Exception("All LDAP bind methods failed")
 
-def enumerate_ldap_auth(target_ip, domain, username, password, lmhash, nthash, output_dir=None):
+def enumerate_ldap_auth(target_ip, domain, username, password, lmhash, nthash, output_dir=None, prefer_ldaps=False):
     """
     Performs a comprehensive, authenticated LDAP enumeration.
     Returns the domain's search_base, a list of the user's groups, and a
@@ -705,10 +713,10 @@ def enumerate_ldap_auth(target_ip, domain, username, password, lmhash, nthash, o
         conn = create_ldap_conn(
             target_ip,
             user_dn,
-            auth_password,          # or just password if you're not using hashes
+            auth_password,
             lmhash=lmhash or None,
             nthash=nthash or None,
-            prefer_ldaps=True
+            prefer_ldaps=prefer_ldaps
         )
         print_success(f"LDAP Bind Successful as {user_dn}")
 
@@ -912,7 +920,7 @@ def enumerate_ldap_auth(target_ip, domain, username, password, lmhash, nthash, o
         print_fail(f"LDAP Error: {e}")
     return search_base, user_groups, findings, user_list
 
-def find_ad_misconfigs_auth(target_ip, domain, username, password, lmhash, nthash, search_base):
+def find_ad_misconfigs_auth(target_ip, domain, username, password, lmhash, nthash, search_base, prefer_ldaps=False):
     """
     Checks for common, high-impact misconfigurations via authenticated LDAP.
     Returns a dictionary of findings (unconstrained delegation, LAPS).
@@ -934,7 +942,7 @@ def find_ad_misconfigs_auth(target_ip, domain, username, password, lmhash, nthas
             auth_password,
             lmhash=lmhash or None,
             nthash=nthash or None,
-            prefer_ldaps=True
+            prefer_ldaps=prefer_ldaps
         )
         print_success(f"LDAP Bind Successful as {user_dn}")
 
@@ -1195,7 +1203,7 @@ def run_anonymous_scan(target_ip, users_file=None, hash_format='hashcat', output
 
     return findings
 
-def run_authenticated_scan(target_ip, username, password, lmhash, nthash, domain=None, hash_format='hashcat', output_dir=None, spider_shares=False):
+def run_authenticated_scan(target_ip, username, password, lmhash, nthash, domain=None, hash_format='hashcat', output_dir=None, spider_shares=False, prefer_ldaps=False):
     """
     Orchestrates the authenticated scanning modules: LDAP enumeration, SMB shares,
     misconfiguration checks, and Kerberoasting.
@@ -1218,7 +1226,7 @@ def run_authenticated_scan(target_ip, username, password, lmhash, nthash, domain
             print_error("LDAP discovery failed even with creds. Please supply --domain <FQDN>")
             sys.exit(1)
 
-    search_base, user_groups, ldap_findings, user_list = enumerate_ldap_auth(target_ip, domain, user, password, lmhash, nthash, output_dir)
+    search_base, user_groups, ldap_findings, user_list = enumerate_ldap_auth(target_ip, domain, user, password, lmhash, nthash, output_dir, prefer_ldaps)
     
     if user_list and output_dir:
         user_file = Path(output_dir) / "ad_users.txt"
@@ -1230,7 +1238,7 @@ def run_authenticated_scan(target_ip, username, password, lmhash, nthash, domain
 
     findings.update(ldap_findings)
     if search_base:
-        misconfig_findings = find_ad_misconfigs_auth(target_ip, domain, user, password, lmhash, nthash, search_base)
+        misconfig_findings = find_ad_misconfigs_auth(target_ip, domain, user, password, lmhash, nthash, search_base, prefer_ldaps)
         findings.update(misconfig_findings)
         findings['domain_name'] = dn_to_dns(search_base)
 
@@ -1266,7 +1274,7 @@ def get_domain_from_ldap(target_ip, username=None, password=None, lmhash=None, n
                     auth_password,
                     lmhash=lmhash,
                     nthash=nthash,
-                    prefer_ldaps=True
+                    prefer_ldaps=False
                 )
                 print_success(f"LDAP Bind Successful as {user_dn}")
             except Exception as auth_err:
@@ -1346,11 +1354,11 @@ Examples:
     g.add_argument("-p", "--password")
     g.add_argument("-H", "--hashes",     help="LM:NT hash")
     g.add_argument("-d", "--domain",     help="Force domain name (useful when discovery fails)")
-
+    g.add_argument("-s", "--secure",     action="store_true", help="Prefer LDAPS (port 636). Default is signed LDAP on 389")
+    
     g = parser.add_argument_group("Output & Modules")
     g.add_argument("-o", "--output",     default="reaper-logs", help="Output dir for logs and hashes (default: reaper-logs)")
     g.add_argument("--spider-shares",    action="store_true", help="Recursively list files on accessible SMB shares")
-
     args = parser.parse_args()
 
     try:
@@ -1365,6 +1373,7 @@ Examples:
     original_stdout = sys.stdout
     log_tee = None
     spider_log = None
+    prefer_ldaps = args.secure
 
     try:
         if args.output:
@@ -1397,7 +1406,7 @@ Examples:
                 enumerate_smb_shares_auth(args.target, domain, user, pw, lmh, nth, True, spider_log)
             else:
                 print_section(f"Authenticated Scan → {args.target} @ {domain}\\{user}")
-                findings = run_authenticated_scan(args.target, args.username, pw, lmh, nth, domain, 'hashcat', outdir, False)
+                findings = run_authenticated_scan(args.target, args.username, pw, lmh, nth, domain, 'hashcat', outdir, False, prefer_ldaps)
                 auth_creds = {'username': args.username, 'password': pw, 'lmhash': lmh, 'nthash': nth}
                 print_suggestions(args.target, findings, auth_creds)
         elif args.spider_shares:
