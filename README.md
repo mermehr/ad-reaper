@@ -62,6 +62,7 @@ Authentication:
   -p, --password PASSWORD
   -H, --hashes HASHES   LM:NT hash
   -d, --domain DOMAIN   Force domain name (useful when discovery fails)
+  -s, --secure          Prefer LDAPS (port 636). Default is signed LDAP on 389
 
 Output & Modules:
   -o, --output OUTPUT   Output dir for logs and hashes (default: reaper-logs)
@@ -79,8 +80,8 @@ Examples:
     python ad-reaper.py 10.10.10.10 -u Administrator -H aad3b...:31d6... --output loot
 ```
 
-## Screenshots
+## Preview
 
 Authenticated scan log:
 
-![auth_scan](./assets/auth_scan.png)
+![auth_scan](./assets/auth-scale.gif)
