@@ -6,11 +6,18 @@ A comprehensive multi-protocol Active Directory (LDAP, SMB, SAMR) enumeration to
 
 Designed to capture and report low hanging fruit fast, with very few dependencies.
 
-**Windows Server 2025+**
+## LDAP connection behavior
 
-Microsoft made LDAP signing the default for new Active Directory deployments on Windows Server 2025.  Any brand-new lab or production domain built on Server 2025 will hit the `LDAP_STRONG_AUTH_REQUIRED / strongerAuthRequired` error on plain NTLM binds over port 389.
+AD-Reaper is built for authorized pentesting and CTF labs. Authenticated LDAP starts with plain NTLM so the scan can reveal whether the DC accepts a bind without LDAP signing or TLS.
 
-LDAPS / StartTLS / signed-NTLM fallback path was added to support the new policy, therefore making it especially useful against fresh 2025 environments and any hardened older ones.
+| Option            | Attempt order                                                                     |
+| ----------------- | --------------------------------------------------------------------------------- |
+| Default           | Plain NTLM on 389, NTLM signing and sealing on 389, StartTLS on 389, LDAPS on 636 |
+| `-s` / `--secure` | LDAPS on 636, StartTLS on 389, NTLM signing and sealing on 389, plain NTLM on 389 |
+
+New AD deployments on Windows Server 2025 require LDAP signing by default. Effective DC policy determines whether a plain NTLM bind is accepted. Existing or upgraded domains can have different policies. See Microsoft's [LDAP signing overview](https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/ldap-signing) and [channel binding overview](https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/ldap-channel-binding).
+
+Domain discovery uses anonymous RootDSE queries with LDAP, StartTLS and LDAPS. `-s` makes it prefer LDAPS. If discovery cannot obtain a domain, supply `-d example.local` or a qualified username such as `'EXAMPLE\tester'`. The separate anonymous enumeration mode retains its existing LDAP behavior.
 
 ## Modes & Features
 
@@ -23,7 +30,7 @@ LDAPS / StartTLS / signed-NTLM fallback path was added to support the new policy
 - **Other AD Checks:** Looks other common misconfigurations that may be exploitable (ACDS, LAPS, admincount, delegations, etc.).
 - **Post-Scan Analysis:** Provides actionable suggestions based on the findings (e.g., reminding you to check for GPP passwords or suggesting specific `secretsdump` targets).
 - **AS-REP Roasting:** Tests the discovered user list for accounts that do not require Kerberos pre-authentication.. (Anon mode)
-- **Kerberoasting:** Identifies service accounts (SPNs).. (Auth mode) 
+- **Kerberoasting:** Identifies service accounts (SPNs).. (Auth mode)
 
 ## Installation
 
@@ -45,7 +52,7 @@ pip install -r requirements.txt
 ## Usage
 
 ```bash
-usage: ad-reaper.py [-h] [-u USERNAME] [-p PASSWORD] [-H HASHES] [-d DOMAIN] [-o OUTPUT]
+usage: ad-reaper.py [-h] [-u USERNAME] [-p PASSWORD] [-H HASHES] [-d DOMAIN] [-s] [-o OUTPUT]
                     [--spider-shares]
                     target
 
@@ -62,7 +69,7 @@ Authentication:
   -p, --password PASSWORD
   -H, --hashes HASHES   LM:NT hash
   -d, --domain DOMAIN   Force domain name (useful when discovery fails)
-  -s, --secure          Prefer LDAPS (port 636). Default is signed LDAP on 389
+  -s, --secure          Prefer LDAPS, then StartTLS, sealed NTLM, plain NTLM (authenticated scans)
 
 Output & Modules:
   -o, --output OUTPUT   Output dir for logs and hashes (default: reaper-logs)
@@ -75,6 +82,9 @@ Examples:
   Authenticated scan:
     python ad-reaper.py 10.10.10.10 -u tommy -p Spring2026
     python ad-reaper.py 10.10.10.10 -d example.local -u tommy -p Spring2026
+
+  Prefer LDAPS with lab certificates:
+    python ad-reaper.py 10.10.10.10 -d example.local -u tommy -p Spring2026 -s
 
   PTH + output dir:
     python ad-reaper.py 10.10.10.10 -u Administrator -H aad3b...:31d6... --output loot
