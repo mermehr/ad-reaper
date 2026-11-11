@@ -15,8 +15,6 @@ Authenticated Mode:
 Leverages credentials to perform a deep-dive enumeration. It checks for accessible shares,
 remote access pathways, and common AD misconfigurations.
 """
-
-from typing import Any
 import sys
 import os
 import re
@@ -29,17 +27,27 @@ import subprocess
 import ssl
 from pathlib import Path
 from impacket.dcerpc.v5 import samr, transport, dcomrt
-from impacket.dcerpc.v5.dcom import wmi
-from impacket.dcerpc.v5.ndr import NULL
-from impacket.dcerpc.v5.samr import UF_DONT_REQUIRE_PREAUTH
-from impacket.dcerpc.v5.samr import DCERPCException
-from impacket.dcerpc.v5.samr import UF_ACCOUNTDISABLE
 from impacket.nmb import NetBIOSError
 from impacket.smb3 import FILE_ATTRIBUTE_DIRECTORY
 from impacket.smbconnection import SMBConnection, SessionError
-from impacket.nt_errors import STATUS_LOGON_FAILURE, STATUS_ACCESS_DENIED, STATUS_USER_SESSION_DELETED
-from ldap3 import Server, Connection, Tls, ANONYMOUS, NTLM, SUBTREE, BASE, ALL, SASL
-from ldap3.core.exceptions import LDAPInvalidCredentialsResult, LDAPSocketOpenError
+from impacket.dcerpc.v5.dcom import wmi
+from impacket.dcerpc.v5.ndr import NULL
+from impacket.dcerpc.v5.samr import (
+    UF_DONT_REQUIRE_PREAUTH, DCERPCException, 
+    UF_ACCOUNTDISABLE
+)
+from impacket.nt_errors import (
+    STATUS_LOGON_FAILURE, STATUS_ACCESS_DENIED,
+    STATUS_USER_SESSION_DELETED
+)
+from ldap3 import (
+    Server, Connection, Tls, ANONYMOUS, NTLM, SUBTREE, BASE, 
+    ALL, NONE, ENCRYPT, TLS_CHANNEL_BINDING,
+)
+from ldap3.core.exceptions import (
+    LDAPException, LDAPBindError, LDAPStartTLSError,
+    LDAPInvalidCredentialsResult, LDAPSocketOpenError,
+)
 
 # ---- Colors ----
 class Style:
@@ -530,27 +538,6 @@ def enumerate_users_samr(target_ip, output_dir=None, domain=None):
         print_fail("FAILED: Anonymous SAMR enumeration is NOT allowed.")
     return all_found_users
 
-def get_domain_from_ldap(target_ip):
-    """
-    Performs a quick anonymous LDAP query to get the domain name.
-    Returns the NetBIOS domain name.
-    """
-    print_info(f"Attempting to discover domain name from {target_ip} via anonymous LDAP...")
-    server = Server(target_ip, get_info=['defaultNamingContext'])
-    conn = None
-    try:
-        conn = Connection(server, authentication=ANONYMOUS, auto_bind=True)  # noqa: F841
-        if server.info and server.info.other.get('defaultNamingContext'):
-            domain_dn = server.info.other['defaultNamingContext'][0]
-            netbios_name = domain_dn.split(',')[0].replace('DC=', '').upper()
-            print_success(f"  -> Discovered domain: {netbios_name}")
-            return netbios_name
-    except (LDAPSocketOpenError, ConnectionRefusedError):
-        print_error(f"  -> Could not connect to LDAP on {target_ip} to auto-discover domain.")
-    except Exception:
-        pass # Fail silently if anonymous bind is not allowed
-    return None
-
 # ---- Authenticated Functions ----
 
 def enumerate_smb_shares_auth(target_ip, domain, username, password, lmhash, nthash, spider_shares=False, spider_log=None):
@@ -627,72 +614,88 @@ def enumerate_smb_shares_auth(target_ip, domain, username, password, lmhash, nth
                 pass
 
 def create_ldap_conn(target_ip, user_dn, password, lmhash=None, nthash=None, prefer_ldaps=False):
-    """
-    Attempts to create an LDAP connection using the provided credentials.
-    Tries multiple methods (LDAPS, StartTLS, LDAP signing) in order of preference.
-    """
-    try:
-        from ldap3 import ENCRYPT, TLS_CHANNEL_BINDING
-    except ImportError:
-        ENCRYPT = None
-        TLS_CHANNEL_BINDING = None
+    """Try NTLM over LDAP, sealed LDAP, StartTLS and LDAPS. Print only the winner."""
+    if not user_dn or user_dn.count("\\") != 1 or not all(user_dn.split("\\", 1)):
+        raise ValueError(r"LDAP NTLM needs DOMAIN\user. Supply --domain <FQDN>.")
 
-    if lmhash and nthash and (not password or ':' not in str(password)):
-        auth_pw = f"{lmhash}:{nthash}"
-    else:
-        auth_pw = password
-
+    auth_pw = f"{lmhash}:{nthash}" if lmhash and nthash else password
     if not auth_pw:
-        raise ValueError("No password or hash provided for NTLM bind")
+        raise ValueError("No password or LM:NT hash supplied for LDAP NTLM")
 
-    attempts: list[Any] = []
     if prefer_ldaps:
-        # Try LDAPS first, then signed NTLM, then StartTLS
-        attempts.append(("ldaps", 636, True))
-        attempts.append(("ldap+sign", 389, False))
-        attempts.append(("ldap+starttls", 389, False))
-        print_info("Attempting LDAP bind with preference for LDAPS (port 636)...")
+        attempts = [("ldaps", 636), ("starttls", 389), ("ntlm-seal", 389), ("ldap", 389)]
     else:
-        # Default: signed NTLM first
-        attempts.append(("ldap+sign", 389, False))
-        attempts.append(("ldap+starttls", 389, False))
-        attempts.append(("ldaps", 636, True))
-        print_info("Attempting LDAP bind with preference for signed NTLM (port 389)...")
+        attempts = [("ldap", 389), ("ntlm-seal", 389), ("starttls", 389), ("ldaps", 636)]
 
-    last_err = None
-    for name, port, use_ssl in attempts:
+    errors = []
+    hints = []
+    for method, port in attempts:
+        conn = None
         try:
-            tls = Tls(validate=ssl.CERT_NONE) if use_ssl else None
-            server = Server(target_ip, port=port, use_ssl=use_ssl, tls=tls, get_info=ALL)
+            use_tls = method in ("starttls", "ldaps")
+            server = Server(
+                target_ip, port=port, use_ssl=(method == "ldaps"),
+                tls=Tls(validate=ssl.CERT_NONE) if use_tls else None,
+                get_info=ALL, connect_timeout=5,
+            )
+            options = {}
+            if method == "ntlm-seal":
+                options["session_security"] = ENCRYPT
+            if method == "ldaps":
+                options["channel_binding"] = TLS_CHANNEL_BINDING
 
-            kwargs = {
-                "user": user_dn,
-                "password": auth_pw,
-                "authentication": NTLM,
-                "auto_bind": False,
-            }
+            conn = Connection(
+                server, user=user_dn, password=auth_pw, authentication=NTLM,
+                auto_bind=False, auto_referrals=False, receive_timeout=10,
+                **options,
+            )
+            conn.open(read_server_info=False)
+            if method == "starttls":
+                if not conn.start_tls(read_server_info=False) or not conn.tls_started:
+                    raise LDAPStartTLSError("StartTLS did not establish TLS")
 
-            # TLS and signing options
-            if name == "ldap+sign" and ENCRYPT is not None:
-                kwargs["session_security"] = ENCRYPT
-            if use_ssl and TLS_CHANNEL_BINDING is not None:
-                kwargs["channel_binding"] = TLS_CHANNEL_BINDING
+            # Leave schema queries until authentication succeeded
+            if conn.bind(read_server_info=False):
+                break
 
-            conn = Connection(server, **kwargs)
+            result = conn.result or {}
+            code = result.get("result")
+            description = result.get("description", "no description")
+            message = " ".join(str(result.get("message", "")).split())
+            errors.append(f"{method}:{port}: LDAP {code} ({description}) {message}".rstrip())
+            if code in (8, 13):
+                hints.append(
+                    f"{method}: server requested stronger authentication or confidentiality"
+                )
+            if "80090346" in message.lower():
+                hints.append(f"{method}: diagnostic indicates a channel binding problem")
 
-            if name == "ldap+starttls":
-                conn.open()
-                conn.start_tls()
+        except Exception as exc:
+            detail = " ".join(str(exc).split())
+            errors.append(f"{method}:{port}: {type(exc).__name__}: {detail}")
 
-            if conn.bind():
-                print_success(f"LDAP bind OK via {name}")
-                return conn
+        # Close failed attempt before trying a new connection
+        if conn is not None:
+            try:
+                conn.unbind()
+            except Exception:
+                conn.strategy.close()
+    else:
+        report = ["All LDAP bind methods failed."] + errors + hints
+        raise LDAPBindError("\n  ".join(report))
 
-        except Exception as e:
-            last_err = e
-            # print_error(f"{name} failed: {e}")
-            
-    raise last_err or Exception("All LDAP bind methods failed")
+    print_success(f"LDAP bind OK as {user_dn} via {method} on port {port}")
+    try:
+        conn.refresh_server_info()
+    except Exception as exc:
+        try:
+            conn.unbind()
+        except Exception:
+            conn.strategy.close()
+        raise LDAPException(
+            f"LDAP bind succeeded via {method}, but reading server information failed: {exc}"
+        ) from exc
+    return conn
 
 def enumerate_ldap_auth(target_ip, domain, username, password, lmhash, nthash, output_dir=None, prefer_ldaps=False):
     """
@@ -703,22 +706,20 @@ def enumerate_ldap_auth(target_ip, domain, username, password, lmhash, nthash, o
     findings = {'spns': [], 'admin_users': [], 'asrep_users': [], 'adcs_servers': []}
     print_section("Authenticated LDAP Enumeration")
     user_dn = f"{domain}\\{username}" if domain else username
-    auth_password = f"{lmhash}:{nthash}" if (lmhash and nthash) else password
     user_groups = []
     user_list = []
     search_base = None
 
+    conn = None
     try:
-        server = Server(target_ip, get_info=ALL)
         conn = create_ldap_conn(
             target_ip,
             user_dn,
-            auth_password,
+            password,
             lmhash=lmhash or None,
             nthash=nthash or None,
             prefer_ldaps=prefer_ldaps
         )
-        print_success(f"LDAP Bind Successful as {user_dn}")
 
         # Prefer the bound connection's info
         if conn.server.info and conn.server.info.other.get('defaultNamingContext'):
@@ -898,8 +899,8 @@ def enumerate_ldap_auth(target_ip, domain, username, password, lmhash, nthash, o
                     findings['admin_users'].append(entry.sAMAccountName.value)
                     print(f"    - {Style.YELLOW}{entry.sAMAccountName.value}{Style.RESET}")
 
-        if server.info and server.info.other.get('configurationNamingContext'):
-            config_nc = server.info.other['configurationNamingContext'][0]
+        if conn.server.info and conn.server.info.other.get('configurationNamingContext'):
+            config_nc = conn.server.info.other['configurationNamingContext'][0]
             print_info("Querying for Certificate Authorities (ADCS) in Configuration NC...")
             pki_base = f"CN=Public Key Services,CN=Services,{config_nc}"
             conn.search(pki_base, '(objectClass=pKIEnrollmentService)', attributes=['cn', 'dNSHostName'])
@@ -911,13 +912,16 @@ def enumerate_ldap_auth(target_ip, domain, username, password, lmhash, nthash, o
                     findings['adcs_servers'].append({'name': ca_name, 'dns': ca_dns})
                     print(f"    - {Style.YELLOW}{ca_name:<25}{Style.RESET} Host: {ca_dns}")
 
-        conn.unbind()
         return search_base, user_groups, findings, user_list
 
-    except LDAPSocketOpenError:
-        print_fail(f"Could not connect to LDAP port 389 on {target_ip}")
     except Exception as e:
         print_fail(f"LDAP Error: {e}")
+    finally:
+        if conn is not None:
+            try:
+                conn.unbind()
+            except Exception:
+                conn.strategy.close()
     return search_base, user_groups, findings, user_list
 
 def find_ad_misconfigs_auth(target_ip, domain, username, password, lmhash, nthash, search_base, prefer_ldaps=False):
@@ -1219,11 +1223,11 @@ def run_authenticated_scan(target_ip, username, password, lmhash, nthash, domain
         print_info(f"Using domain parsed from username: {domain}")
     else:
         print_info("No domain in username or --domain → trying LDAP discovery...")
-        discovered = get_domain_from_ldap(target_ip, username, password, lmhash, nthash)
+        discovered = get_domain_from_ldap(target_ip, prefer_ldaps=prefer_ldaps)
         if discovered:
             domain = discovered
         else:
-            print_error("LDAP discovery failed even with creds. Please supply --domain <FQDN>")
+            print_error("Could not discover the domain. Supply --domain <FQDN>.")
             sys.exit(1)
 
     search_base, user_groups, ldap_findings, user_list = enumerate_ldap_auth(target_ip, domain, user, password, lmhash, nthash, output_dir, prefer_ldaps)
@@ -1247,64 +1251,55 @@ def run_authenticated_scan(target_ip, username, password, lmhash, nthash, domain
     check_access_paths_auth(target_ip, user_groups, user, password, lmhash, nthash, domain)
     return findings
 
-def get_domain_from_ldap(target_ip, username=None, password=None, lmhash=None, nthash=None):  # noqa: F811
-    """
-    Discover domain FQDN via LDAP RootDSE query.
-    Tries anonymous bind first; if that fails and creds are provided, uses authenticated bind.
-    Returns domain FQDN (e.g., 'forest.htb') or None on failure.
-    """
-    print_info(f"Discovering domain from {target_ip} via LDAP RootDSE...")
+def get_domain_from_ldap(target_ip, prefer_ldaps=False):
+    """Discover a domain anonymously through RootDSE, using LDAP or TLS."""
+    if prefer_ldaps:
+        attempts = [("ldaps", 636), ("starttls", 389), ("ldap", 389)]
+    else:
+        attempts = [("ldap", 389), ("starttls", 389), ("ldaps", 636)]
 
-    server = Server(target_ip, get_info=ALL)
-    conn = None
-    try:
-        # First, try anonymous
-        conn = Connection(server, authentication=ANONYMOUS, auto_bind=True)
-        print_success("Anonymous bind worked for discovery")
+    errors = []
+    for method, port in attempts:
+        conn = None
+        try:
+            use_tls = method in ("starttls", "ldaps")
+            server = Server(
+                target_ip, port=port, use_ssl=(method == "ldaps"),
+                tls=Tls(validate=ssl.CERT_NONE) if use_tls else None,
+                get_info=NONE, connect_timeout=5,
+            )
+            conn = Connection(
+                server, authentication=ANONYMOUS, auto_bind=False,
+                auto_referrals=False, receive_timeout=10,
+            )
+            conn.open(read_server_info=False)
+            if method == "starttls":
+                if not conn.start_tls(read_server_info=False) or not conn.tls_started:
+                    raise LDAPStartTLSError("StartTLS did not establish TLS")
 
-    except (LDAPInvalidCredentialsResult, LDAPSocketOpenError) as anon_err:
-        print_error(f"Anonymous bind failed: {anon_err} — trying authenticated if creds available...")
-        if username and (password or (lmhash and nthash)):
-            user_dn = f"{username}"  # Adjust if needed for DOMAIN\user
-            auth_password = f"{lmhash}:{nthash}" if lmhash and nthash else password
-            try:
-                conn = create_ldap_conn(
-                    target_ip,
-                    user_dn,
-                    auth_password,
-                    lmhash=lmhash,
-                    nthash=nthash,
-                    prefer_ldaps=False
-                )
-                print_success(f"LDAP Bind Successful as {user_dn}")
-            except Exception as auth_err:
-                print_error(f"Authenticated bind failed: {auth_err}")
-                return None
-        else:
-            print_error("No creds provided for authenticated discovery — cannot proceed")
-            return None
+            if not conn.bind(read_server_info=False):
+                errors.append(f"{method}:{port}: anonymous bind rejected: {conn.result}")
+                continue
 
-    except Exception as e:
-        print_error(f"LDAP connection failed: {e}")
-        return None
+            conn.search("", "(objectClass=*)", BASE, attributes=["defaultNamingContext"])
+            if conn.entries and "defaultNamingContext" in conn.entries[0]:
+                fqdn = dn_to_dns(conn.entries[0].defaultNamingContext.value)
+                if fqdn:
+                    print_success(f"Discovered domain {fqdn} via anonymous {method} on port {port}")
+                    return fqdn
+            errors.append(f"{method}:{port}: RootDSE returned no usable domain: {conn.result}")
 
-    try:
-        conn.search('', '(objectClass=*)', BASE, attributes=['defaultNamingContext'])
-        if conn.entries and 'defaultNamingContext' in conn.entries[0]:
-            dn = conn.entries[0].defaultNamingContext.value
-            fqdn = dn_to_dns(dn)
-            if fqdn:
-                print_success(f"Discovered domain FQDN: {fqdn}")
-                return fqdn
-            else:
-                print_error("Could not convert DN to FQDN")
-        else:
-            print_error("No RootDSE info found")
-    except Exception as e:
-        print_error(f"RootDSE query failed: {e}")
-    finally:
-        if conn:
-            conn.unbind()
+        except Exception as exc:
+            detail = " ".join(str(exc).split())
+            errors.append(f"{method}:{port}: {type(exc).__name__}: {detail}")
+        finally:
+            if conn is not None:
+                try:
+                    conn.unbind()
+                except Exception:
+                    conn.strategy.close()
+
+    print_error("Domain discovery failed across LDAP methods.\n  " + "\n  ".join(errors))
     return None
 
 # ---- Main ----
@@ -1354,7 +1349,7 @@ Examples:
     g.add_argument("-p", "--password")
     g.add_argument("-H", "--hashes",     help="LM:NT hash")
     g.add_argument("-d", "--domain",     help="Force domain name (useful when discovery fails)")
-    g.add_argument("-s", "--secure",     action="store_true", help="Prefer LDAPS (port 636). Default is signed LDAP on 389")
+    g.add_argument("-s", "--secure",     action="store_true", help="Auth LDAP: prefer LDAPS, then StartTLS, sealed NTLM, plain NTLM. Default tries plain NTLM first")
     
     g = parser.add_argument_group("Output & Modules")
     g.add_argument("-o", "--output",     default="reaper-logs", help="Output dir for logs and hashes (default: reaper-logs)")
@@ -1402,7 +1397,7 @@ Examples:
             if args.spider_shares:
                 print_section(f"SMB Spider Module (Auth) → {args.target}")
                 if not domain:
-                    domain = get_domain_from_ldap(args.target, args.username, pw, lmh, nth) or 'WORKGROUP'
+                    domain = get_domain_from_ldap(args.target, prefer_ldaps=prefer_ldaps) or 'WORKGROUP'
                 enumerate_smb_shares_auth(args.target, domain, user, pw, lmh, nth, True, spider_log)
             else:
                 print_section(f"Authenticated Scan → {args.target} @ {domain}\\{user}")
